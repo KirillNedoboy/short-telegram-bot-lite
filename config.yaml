@@ -77,6 +77,10 @@ volume_climax_min_price_change_5m_pct: 3.0
 volume_climax_max_oi_change_5m_pct: -1.0
 volume_climax_min_rejection_pct: 2.0
 volume_climax_max_entry_distance_below_high_pct: 20.0
+volume_climax_lifecycle_shadow_enabled: true
+volume_climax_confirmation_window_minutes: 3
+volume_climax_min_closed_candles_after_high: 2
+volume_climax_max_lifetime_minutes: 15
 low_volume_extension_enabled: true
 low_volume_min_price_extension_pct: 5.0
 low_volume_max_current_previous_volume_ratio: 0.70

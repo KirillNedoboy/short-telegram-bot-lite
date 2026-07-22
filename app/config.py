@@ -92,6 +92,10 @@ class AppConfig(BaseModel):
     volume_climax_max_oi_change_5m_pct: float = -1.0
     volume_climax_min_rejection_pct: float = 2.0
     volume_climax_max_entry_distance_below_high_pct: float = 20.0
+    volume_climax_lifecycle_shadow_enabled: bool = True
+    volume_climax_confirmation_window_minutes: int = 3
+    volume_climax_min_closed_candles_after_high: int = 2
+    volume_climax_max_lifetime_minutes: int = 15
     low_volume_extension_enabled: bool = False
     low_volume_min_price_extension_pct: float = 5.0
     low_volume_max_current_previous_volume_ratio: float = 0.70

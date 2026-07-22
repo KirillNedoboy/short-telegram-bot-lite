@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -21,6 +22,109 @@ class ClimaxEvaluation:
     @property
     def actionable(self) -> bool:
         return self.subtype is not None and not self.veto_reasons and self.grade in {"A", "B"}
+
+
+@dataclass(slots=True)
+class VolumeClimaxLifecycle:
+    """Shadow lifecycle decision for one root volume-climax event."""
+
+    state: str
+    event_revision: int
+    root_created_at: datetime
+    latest_high: float
+    latest_high_at: datetime
+    confirmation_started_at: datetime
+    last_observed_at: datetime
+    veto_reasons: list[str]
+    expired: bool = False
+
+
+def advance_volume_climax_lifecycle(
+    *,
+    root_created_at: datetime,
+    latest_high: float,
+    latest_high_at: datetime,
+    confirmation_started_at: datetime,
+    last_observed_at: datetime,
+    event_revision: int,
+    current_high: float,
+    observed_at: datetime,
+    closed_candles_after_high: int,
+    max_lifetime_minutes: int,
+    confirmation_window_minutes: int,
+    price_acceleration_resumed: bool = False,
+    active_short_squeeze: bool = False,
+    oi_continuation: bool = False,
+    rejection_ok: bool = False,
+    liquidity_ok: bool = False,
+    entry_distance_ok: bool = False,
+) -> VolumeClimaxLifecycle:
+    """Advance the bounded shadow lifecycle without mutating the root timestamp.
+
+    A new high starts a new revision and confirmation window, but root lifetime
+    always remains anchored to ``root_created_at``. Fallback is deliberately
+    hard-gated and cannot be inferred from elapsed time alone.
+    """
+    if observed_at < root_created_at:
+        raise ValueError("observed_at cannot precede root_created_at")
+    if current_high <= 0 or latest_high <= 0:
+        raise ValueError("high prices must be positive")
+
+    root_age_minutes = (observed_at - root_created_at).total_seconds() / 60
+    if root_age_minutes > max_lifetime_minutes:
+        return VolumeClimaxLifecycle(
+            state="EXPIRED",
+            event_revision=event_revision,
+            root_created_at=root_created_at,
+            latest_high=latest_high,
+            latest_high_at=latest_high_at,
+            confirmation_started_at=confirmation_started_at,
+            last_observed_at=observed_at,
+            veto_reasons=["root_lifetime_expired"],
+            expired=True,
+        )
+
+    if current_high > latest_high:
+        return VolumeClimaxLifecycle(
+            state="CLIMAX_WATCHING",
+            event_revision=event_revision + 1,
+            root_created_at=root_created_at,
+            latest_high=current_high,
+            latest_high_at=observed_at,
+            confirmation_started_at=observed_at,
+            last_observed_at=observed_at,
+            veto_reasons=[],
+        )
+
+    reasons: list[str] = []
+    confirmation_age_minutes = (observed_at - confirmation_started_at).total_seconds() / 60
+    if closed_candles_after_high < 2:
+        reasons.append("insufficient_closed_candles_after_high")
+    if confirmation_age_minutes < confirmation_window_minutes:
+        reasons.append("confirmation_window_open")
+    if price_acceleration_resumed:
+        reasons.append("price_acceleration_resumed")
+    if active_short_squeeze:
+        reasons.append("active_short_squeeze")
+    if oi_continuation:
+        reasons.append("oi_continuation")
+    if not rejection_ok:
+        reasons.append("rejection_missing")
+    if not liquidity_ok:
+        reasons.append("liquidity_not_confirmed")
+    if not entry_distance_ok:
+        reasons.append("entry_distance_not_confirmed")
+
+    return VolumeClimaxLifecycle(
+        state="FALLBACK_READY" if not reasons else "CLIMAX_WATCHING",
+        event_revision=event_revision,
+        root_created_at=root_created_at,
+        latest_high=latest_high,
+        latest_high_at=latest_high_at,
+        confirmation_started_at=confirmation_started_at,
+        last_observed_at=observed_at,
+        veto_reasons=reasons,
+    )
 
 
 def evaluate_climax(
