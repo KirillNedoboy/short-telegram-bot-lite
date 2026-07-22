@@ -1,0 +1,308 @@
+"""Deterministic, non-executing climax short evaluators."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import pandas as pd
+
+from app.domain import EventState, SymbolFeatures
+
+
+@dataclass(slots=True)
+class ClimaxEvaluation:
+    subtype: str | None
+    score: int
+    grade: str
+    metadata: dict[str, Any]
+    veto_reasons: list[str]
+    data_quality: list[str]
+
+    @property
+    def actionable(self) -> bool:
+        return self.subtype is not None and not self.veto_reasons and self.grade in {"A", "B"}
+
+
+def evaluate_climax(
+    state: EventState,
+    features: SymbolFeatures,
+    frame: pd.DataFrame,
+    config: Any,
+    *,
+    frozen_initial_extension_pct: float | None = None,
+    current_ret5_gate_enabled: bool = True,
+) -> ClimaxEvaluation:
+    """Evaluate both climax patterns; required gates run before score.
+
+    The optional extension arguments are used only by V3B shadow evaluation;
+    defaults preserve the live evaluator semantics exactly.
+    """
+    base = _common_metadata(state, features, frame)
+    candidates: list[ClimaxEvaluation] = []
+    if config.volume_climax_unwind_enabled:
+        candidates.append(_volume_climax(base, state, features, config))
+    if config.low_volume_extension_enabled:
+        candidates.append(
+            _low_volume(
+                base,
+                state,
+                features,
+                config,
+                frozen_initial_extension_pct=frozen_initial_extension_pct,
+                current_ret5_gate_enabled=current_ret5_gate_enabled,
+            )
+        )
+    valid = [item for item in candidates if item.actionable]
+    if valid:
+        return max(valid, key=lambda item: item.score)
+    vetoed = [item for item in candidates if item.veto_reasons]
+    if vetoed:
+        return max(vetoed, key=lambda item: item.score)
+    return ClimaxEvaluation(None, 0, "C", base, ["no_climax_admission"], [])
+
+
+def _common_metadata(state: EventState, features: SymbolFeatures, frame: pd.DataFrame) -> dict[str, Any]:
+    timestamps = pd.Series(pd.to_datetime(frame["timestamp"], utc=True, errors="coerce"), index=frame.index) if "timestamp" in frame else pd.Series(pd.to_datetime(frame.index, utc=True, errors="coerce"), index=frame.index)
+    asof_utc = pd.Timestamp(features.asof).tz_convert("UTC")
+    latest_closed = frame.loc[timestamps <= asof_utc].copy()
+    high = float(max(state.event_high or 0.0, float(latest_closed["high"].max()) if not latest_closed.empty else 0.0))
+    previous_high = float(state.event_high or high)
+    previous_window = latest_closed.iloc[-10:-5] if len(latest_closed) >= 10 else latest_closed.iloc[:-5]
+    current_window = latest_closed.iloc[-5:] if len(latest_closed) >= 5 else latest_closed
+    volume_windows_equal = len(previous_window) == len(current_window) == 5
+    previous_leg_volume = float(previous_window["volume"].sum()) if not previous_window.empty else 0.0
+    current_leg_volume = float(current_window["volume"].sum()) if not current_window.empty else 0.0
+    leg_ratio = current_leg_volume / previous_leg_volume if previous_leg_volume > 0 else 0.0
+    distance = ((high - features.price) / high * 100) if high else None
+    rejection = float(features.rejection_from_high_pct)
+    breakout_reference = previous_high * (1.0 - 0.005)
+    data_after_high = latest_closed.loc[timestamps.loc[latest_closed.index] > pd.Timestamp(state.event_high_time).tz_convert("UTC")] if state.event_high_time else latest_closed.iloc[0:0]
+    post_high_high = float(data_after_high["high"].max()) if not data_after_high.empty else None
+    if state.event_high_time:
+        confirmation_end = pd.Timestamp(state.event_high_time).tz_convert("UTC") + pd.Timedelta(minutes=3)
+        confirmation_window = data_after_high.loc[timestamps.loc[data_after_high.index] <= confirmation_end]
+    else:
+        confirmation_window = data_after_high.iloc[0:0]
+    post_high_closes = confirmation_window["close"].tolist() if "close" in confirmation_window else []
+    post_high_count = len(confirmation_window)
+    retest_window = data_after_high.loc[timestamps.loc[data_after_high.index] > confirmation_end] if state.event_high_time else data_after_high.iloc[0:0]
+    post_high_retest_high = float(retest_window["high"].max()) if not retest_window.empty else None
+    local_prior = latest_closed.iloc[-8:-5] if len(latest_closed) >= 8 else latest_closed.iloc[:-5]
+    local_swing_low = float(local_prior["low"].min()) if not local_prior.empty else None
+    current_close = float(latest_closed["close"].iloc[-1]) if not latest_closed.empty else features.price
+    return {
+        "strategy_type": "CLIMAX_EXHAUSTION",
+        "model_version": "climax-v1",
+        "event_high": high,
+        "previous_leg_high": previous_high,
+        "current_leg_high": float(frame["high"].iloc[-1]),
+        "previous_leg_volume": previous_leg_volume,
+        "current_leg_volume": current_leg_volume,
+        "current_previous_volume_ratio": leg_ratio,
+        "volume_efficiency_ratio": leg_ratio,
+        "entry_distance_below_high_pct": distance,
+        "price_change_5m": features.ret_5m,
+        "price_change_15m": features.ret_15m,
+        "oi_change_5m": features.oi_change_pct,
+        "volume_zscore": features.vol_zscore_30m,
+        "rejection_pct": rejection,
+        "funding": features.funding_rate,
+        "premium": None,
+        "spread_pct": features.spread_pct,
+        "slippage_pct": features.slippage_pct,
+        "depth_1pct_usdt": features.orderbook_depth_usdt_1pct,
+        "depth_2pct_usdt": features.orderbook_depth_usdt_2pct,
+        "liquidity_warning": False,
+        "volume_windows_equal": volume_windows_equal,
+        "volume_window_previous_candles": len(previous_window),
+        "volume_window_current_candles": len(current_window),
+        "closed_candles_after_high": post_high_count,
+        "post_high_closes": post_high_closes,
+        "post_high_high": post_high_high,
+        "post_high_retest_high": post_high_retest_high,
+        "breakout_reference": breakout_reference,
+        "local_swing_low": local_swing_low,
+        "current_close": current_close,
+    }
+
+
+def _volume_climax(base: dict[str, Any], state: EventState, features: SymbolFeatures, config: Any) -> ClimaxEvaluation:
+    data = dict(base)
+    data["strategy_subtype"] = "VOLUME_CLIMAX_UNWIND"
+    volume_ratio = float(base.get("current_previous_volume_ratio") or _volume_ratio(features.current_volume, state))
+    data["volume_ratio"] = volume_ratio
+    data["current_previous_volume_ratio"] = volume_ratio
+    data["failed_high_pct"] = data["rejection_pct"]
+    vetoes: list[str] = []
+    quality: list[str] = []
+    if features.oi_change_pct is None or features.derivatives_status in {"MISSING", "RATE_LIMITED", "API_ERROR"}:
+        vetoes.append("oi_missing_for_volume_climax")
+    elif features.oi_change_pct >= 0 and features.ret_5m > 0:
+        vetoes.append("price_oi_accelerating_together")
+    if volume_ratio < config.volume_climax_min_volume_ratio and features.vol_zscore_30m < config.volume_climax_min_volume_zscore:
+        vetoes.append("volume_climax_not_extreme")
+    if features.ret_5m < config.volume_climax_min_price_change_5m_pct:
+        vetoes.append("price_acceleration_below_threshold")
+    if features.ret_15m < config.volume_climax_min_ret_15m_pct:
+        vetoes.append("pump_below_threshold")
+    if data["rejection_pct"] < config.volume_climax_min_rejection_pct:
+        vetoes.append("rejection_missing")
+    if (data["entry_distance_below_high_pct"] or 999) > config.volume_climax_max_entry_distance_below_high_pct:
+        vetoes.append("entry_too_far_from_high")
+    score = _score([features.ret_5m >= config.volume_climax_min_price_change_5m_pct, volume_ratio >= config.volume_climax_min_volume_ratio or features.vol_zscore_30m >= config.volume_climax_min_volume_zscore, (features.oi_change_pct or 0) < config.volume_climax_max_oi_change_5m_pct, data["rejection_pct"] >= config.volume_climax_min_rejection_pct, features.latest_failed_retest])
+    grade = _grade(score)
+    if features.liquidity_available and _liquidity_blocked(features, config, climax=True):
+        vetoes.append("climax_liquidity_block")
+    elif features.liquidity_available and _liquidity_warning(features, config):
+        data["liquidity_warning"] = True
+        grade = "B"
+    return ClimaxEvaluation("VOLUME_CLIMAX_UNWIND" if not vetoes and score >= config.climax_min_signal_score else None, score, grade, data, vetoes, quality)
+
+
+def _low_volume(
+    base: dict[str, Any],
+    state: EventState,
+    features: SymbolFeatures,
+    config: Any,
+    *,
+    frozen_initial_extension_pct: float | None = None,
+    current_ret5_gate_enabled: bool = True,
+) -> ClimaxEvaluation:
+    data = dict(base)
+    data["strategy_subtype"] = "LOW_VOLUME_EXTENSION_FAILURE"
+    prev_volume = float(base.get("previous_leg_volume") or (state.event_features_snapshot or {}).get("previous_leg_volume") or max(features.current_volume, 1.0))
+    current_volume = float(base.get("current_leg_volume") or features.current_volume)
+    ratio = current_volume / prev_volume if prev_volume else 0.0
+    efficiency = float(base.get("volume_efficiency_ratio") or ratio)
+    data.update({"previous_leg_volume": prev_volume, "current_leg_volume": current_volume, "current_previous_volume_ratio": ratio, "volume_efficiency_ratio": efficiency, "failed_high_pct": data["rejection_pct"]})
+    vetoes: list[str] = []
+    quality: list[str] = []
+    closed_count = int(data.get("closed_candles_after_high") or 0)
+    post_high_high = data.get("post_high_high")
+    post_high_retest_high = data.get("post_high_retest_high")
+    high = float(data["event_high"])
+    tol = float(config.low_volume_max_new_high_tolerance_pct)
+    lower_high = post_high_retest_high is not None and float(post_high_retest_high) <= high * (1.0 + tol / 100.0)
+    closes = [float(x) for x in data.get("post_high_closes", [])]
+    close_below_breakout = bool(closes) and any(x < float(data["breakout_reference"]) for x in closes)
+    micro_break = close_below_breakout
+    failed_retest = bool(features.latest_failed_retest)
+    if post_high_retest_high is not None:
+        # A temporary dip is not enough: price must close materially below the
+        # highest post-event retest. This preserves AKE's completed failure and
+        # rejects ESPORTS while it is still recovering upward.
+        failed_retest = failed_retest or float(data["current_close"]) < float(post_high_retest_high) * 0.997
+    data["failed_retest_confirmed"] = failed_retest
+    data["microstructure_break_confirmed"] = micro_break
+    age_minutes = None
+    if state.event_high_time:
+        age_minutes = (pd.Timestamp(features.asof).tz_convert("UTC") - pd.Timestamp(state.event_high_time).tz_convert("UTC")).total_seconds() / 60
+    data["minutes_after_high"] = age_minutes
+    if not state.event_id:
+        vetoes.append("no_established_event")
+    if not data.get("volume_windows_equal"):
+        vetoes.append("incomparable_volume_windows")
+    if config.low_volume_require_closed_candles_only and closed_count < config.low_volume_min_closed_candles_after_high:
+        vetoes.append("insufficient_closed_candles_after_high")
+    if age_minutes is not None and age_minutes > getattr(config, "low_volume_max_minutes_after_high", 15):
+        vetoes.append("confirmation_window_expired")
+    if data.get("post_high_high") is not None and float(data["post_high_high"]) > high * (1.0 + tol / 100.0):
+        vetoes.append("new_high_before_delivery")
+    extension_value = features.ret_5m if current_ret5_gate_enabled else frozen_initial_extension_pct
+    data["initial_extension_pct"] = frozen_initial_extension_pct
+    data["extension_gate_value"] = extension_value
+    if extension_value is None:
+        vetoes.append("initial_extension_missing")
+    elif extension_value < config.low_volume_min_price_extension_pct:
+        vetoes.append("extension_below_threshold")
+    if ratio > config.low_volume_max_current_previous_volume_ratio or efficiency > config.low_volume_max_volume_efficiency_ratio:
+        vetoes.append("second_leg_volume_confirmed")
+    if config.low_volume_require_close_below_breakout and not close_below_breakout:
+        vetoes.append("close_not_below_breakout_reference")
+    if config.low_volume_require_lower_high_or_failed_retest and not (lower_high and failed_retest):
+        vetoes.append("lower_high_or_failed_retest_missing")
+    if config.low_volume_require_microstructure_break and not micro_break:
+        vetoes.append("microstructure_break_missing")
+    if features.oi_change_pct is not None and features.oi_change_pct >= 1.0:
+        vetoes.append("oi_accelerating_up")
+    if config.low_volume_block_active_short_squeeze and features.oi_change_pct is not None and features.oi_change_pct < 0 and features.ret_5m > config.low_volume_min_price_extension_pct * 0.5 and not failed_retest:
+        vetoes.append("active_short_squeeze")
+    if config.low_volume_block_price_acceleration_resumed and features.ret_5m > 0 and not failed_retest:
+        vetoes.append("price_acceleration_resumed")
+    if data["rejection_pct"] < config.low_volume_min_rejection_pct:
+        vetoes.append("rejection_missing")
+    if (data["entry_distance_below_high_pct"] or 999) > config.low_volume_max_entry_distance_below_high_pct:
+        vetoes.append("entry_too_far_from_high")
+    score = _score([bool(state.event_id), ratio <= config.low_volume_max_current_previous_volume_ratio, efficiency <= config.low_volume_max_volume_efficiency_ratio, close_below_breakout, lower_high and failed_retest, micro_break, features.oi_change_pct is None or features.oi_change_pct < 0])
+    grade = _grade(score)
+    if features.liquidity_available and _liquidity_blocked(features, config, climax=True):
+        vetoes.append("climax_liquidity_block")
+    elif features.liquidity_available and _liquidity_warning(features, config):
+        data["liquidity_warning"] = True
+        if config.low_volume_high_liquidity_risk_mode == "block":
+            vetoes.append("high_liquidity_risk")
+        else:
+            grade = "B"
+            score = min(score, config.climax_min_signal_score)
+    if features.oi_change_pct is None:
+        data["oi_confirmation_state"] = "unavailable"
+        grade = "B"
+    elif features.oi_change_pct < 0:
+        data["oi_confirmation_state"] = "possible_short_covering"
+        if grade == "A":
+            grade = "B"
+    elif features.oi_change_pct < features.ret_5m:
+        data["oi_confirmation_state"] = "slow"
+    else:
+        data["oi_confirmation_state"] = "flat"
+    return ClimaxEvaluation("LOW_VOLUME_EXTENSION_FAILURE" if not vetoes and score >= config.climax_min_signal_score else None, score, grade, data, vetoes, quality)
+
+
+
+
+def evaluate_climax_shadow(
+    state: EventState,
+    features: SymbolFeatures,
+    frame: pd.DataFrame,
+    config: Any,
+) -> ClimaxEvaluation:
+    """Evaluate the V3B frozen-extension variant without changing live rules."""
+    snapshot = state.event_features_snapshot or {}
+    frozen = snapshot.get("initial_extension_pct")
+    try:
+        frozen_value = float(frozen) if frozen is not None else None
+    except (TypeError, ValueError):
+        frozen_value = None
+    return evaluate_climax(
+        state,
+        features,
+        frame,
+        config,
+        frozen_initial_extension_pct=frozen_value,
+        current_ret5_gate_enabled=False,
+    )
+
+
+def _volume_ratio(current: float, state: EventState) -> float:
+    prior = float((state.event_features_snapshot or {}).get("previous_leg_volume") or 0.0)
+    return current / prior if prior > 0 else 3.0
+
+
+def _score(flags: list[bool]) -> int:
+    return min(100, int(sum(flags) * 15 + 10))
+
+
+def _grade(score: int) -> str:
+    return "A" if score >= 85 else "B" if score >= 70 else "C"
+
+
+def _liquidity_blocked(features: SymbolFeatures, config: Any, climax: bool = False) -> bool:
+    spread = config.climax_max_spread_pct if climax else config.max_spread_pct
+    slip = config.climax_max_slippage_pct if climax else config.max_slippage_pct
+    d1 = config.climax_min_depth_1pct_usdt if climax else config.min_orderbook_depth_usdt_1pct
+    d2 = config.climax_min_depth_2pct_usdt if climax else config.min_orderbook_depth_usdt_2pct
+    return bool((features.spread_pct is not None and features.spread_pct > spread) or (features.slippage_pct is not None and features.slippage_pct > slip) or (features.orderbook_depth_usdt_1pct is not None and features.orderbook_depth_usdt_1pct < d1) or (features.orderbook_depth_usdt_2pct is not None and features.orderbook_depth_usdt_2pct < d2))
+
+
+def _liquidity_warning(features: SymbolFeatures, config: Any) -> bool:
+    return bool((features.orderbook_depth_usdt_1pct or 0) < config.min_orderbook_depth_usdt_1pct or (features.orderbook_depth_usdt_2pct or 0) < config.min_orderbook_depth_usdt_2pct)
