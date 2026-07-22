@@ -97,6 +97,29 @@ def test_price_up_oi_up_is_veto(make_features, make_event_state, make_frame):
     assert "price_oi_accelerating_together" in result.veto_reasons
 
 
+def test_missing_liquidity_blocks_live_volume_candidate(make_features, make_event_state, make_frame):
+    features = make_features(
+        ret_5m=10.0,
+        ret_15m=15.0,
+        vol_zscore_30m=8.0,
+        oi_change_pct=-4.0,
+        derivatives_status="OK",
+        rejection_from_high_pct=3.0,
+        liquidity_available=False,
+    )
+    result = evaluate_climax(make_event_state(), features, make_frame([100 + i * 0.1 for i in range(30)]), _config(low_volume_extension_enabled=False))
+    assert not result.actionable
+    assert "liquidity_not_confirmed" in result.veto_reasons
+
+
+def test_volume_candidate_metadata_survives_other_strategy_selection(make_features, make_event_state, make_frame):
+    features = make_features(ret_5m=10.0, ret_15m=15.0, vol_zscore_30m=8.0, oi_change_pct=4.0, derivatives_status="OK", rejection_from_high_pct=3.0)
+    result = evaluate_climax(make_event_state(), features, make_frame([100 + i * 0.1 for i in range(30)]), _config())
+    assert result.metadata["volume_climax_observed"] is True
+    assert result.metadata["volume_climax_candidate"] is False
+    assert "volume_climax_metadata" in result.metadata
+
+
 def test_low_volume_extension_with_missing_oi_is_grade_b(make_features, make_event_state, make_frame):
     state = make_event_state(event_high=115.0, event_high_time=datetime(2026, 4, 13, 12, 5, tzinfo=timezone.utc))
     features = make_features(asof=datetime(2026, 4, 13, 12, 10, tzinfo=timezone.utc), price=112.0, ret_5m=6.0, rejection_from_high_pct=3.0, current_volume=100.0, oi_change_pct=None, derivatives_status="MISSING", latest_failed_retest=True)

@@ -587,7 +587,7 @@ class BotRepository:
                 return model.peak_revision, model.initial_extension_pct
         except Exception:
             logger.exception("shadow root-event write failed symbol=%s root_event_id=%s", symbol, root_event_id)
-            return 1, initial_extension_pct
+            raise
 
     def upsert_shadow_entry_attempt(
         self,
@@ -620,6 +620,12 @@ class BotRepository:
                         confirmation_started_at=observed_at,
                         confirmation_expires_at=confirmation_expires_at,
                         attempt_state=attempt_state,
+                        attempt_close_reason=close_reason,
+                        attempt_closed_at=(
+                            observed_at
+                            if close_reason or attempt_state in _TERMINAL_ATTEMPT_STATES
+                            else None
+                        ),
                         last_observed_at=observed_at,
                     )
                     session.add(model)

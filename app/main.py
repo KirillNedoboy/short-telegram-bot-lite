@@ -28,7 +28,7 @@ from app.market.scanner import MarketScanner
 from app.notifications.telegram import TelegramNotifier
 from app.notifications.throttling import ErrorThrottler
 from app.outcomes.tracker import OutcomeTracker
-from app.signals.climax import ClimaxEvaluation, advance_volume_climax_lifecycle, evaluate_climax, evaluate_climax_shadow
+from app.signals.climax import ClimaxEvaluation, advance_volume_climax_lifecycle, evaluate_climax, evaluate_climax_shadow, volume_climax_attempt_id
 from app.signals.engine import SignalEngine
 from app.signals.formatter import format_signal_message
 from app.storage.db import Database
@@ -534,9 +534,15 @@ class ShortSignalBot:
         event_revision = int((state.event_features_snapshot or {}).get("root_event_revision") or 1)
         lifecycle_shadow = None
         lifecycle_attempt_id: str | None = None
-        if self._config.volume_climax_lifecycle_shadow_enabled and evaluation.subtype == "VOLUME_CLIMAX_UNWIND":
+        shadow_attempt_id: str | None = None
+        lifecycle_metadata = evaluation.metadata.get("volume_climax_metadata") or evaluation.metadata
+        is_volume_climax_candidate = bool(evaluation.metadata.get("volume_climax_candidate")) or (
+            evaluation.subtype == "VOLUME_CLIMAX_UNWIND"
+            or evaluation.metadata.get("strategy_subtype") == "VOLUME_CLIMAX_UNWIND"
+        )
+        if self._config.volume_climax_lifecycle_shadow_enabled and is_volume_climax_candidate:
             snapshot = dict(state.event_features_snapshot or {})
-            current_high = float(evaluation.metadata.get("event_high") or features.price)
+            current_high = float(lifecycle_metadata.get("event_high") or features.price)
             prior_high = float(snapshot.get("volume_climax_latest_high") or current_high)
             root_created_at = state.event_start_time or state.event_high_time or features.asof
             latest_high_at = _parse_optional_datetime(snapshot.get("volume_climax_latest_high_at")) or state.event_high_time or root_created_at
@@ -552,15 +558,16 @@ class ShortSignalBot:
                 event_revision=prior_revision,
                 current_high=current_high,
                 observed_at=features.asof,
-                closed_candles_after_high=int(evaluation.metadata.get("closed_candles_after_high") or 0),
+                closed_candles_after_high=int(lifecycle_metadata.get("closed_candles_after_high") or 0),
+                min_closed_candles_after_high=self._config.volume_climax_min_closed_candles_after_high,
                 max_lifetime_minutes=self._config.volume_climax_max_lifetime_minutes,
                 confirmation_window_minutes=self._config.volume_climax_confirmation_window_minutes,
-                price_acceleration_resumed=features.ret_5m > 0 and not features.latest_failed_retest,
-                active_short_squeeze=(features.oi_change_pct is not None and features.oi_change_pct < 0 and features.ret_5m > 0 and not features.latest_failed_retest),
+                price_acceleration_resumed=features.ret_5m > 0,
+                active_short_squeeze=(features.oi_change_pct is not None and features.oi_change_pct < 0 and features.ret_5m > 0),
                 oi_continuation=features.oi_change_pct is None or features.oi_change_pct >= 0,
-                rejection_ok=float(evaluation.metadata.get("rejection_pct") or 0.0) >= self._config.volume_climax_min_rejection_pct,
-                liquidity_ok=not features.liquidity_available or not bool(evaluation.metadata.get("liquidity_warning")),
-                entry_distance_ok=float(evaluation.metadata.get("entry_distance_below_high_pct") or 999.0) <= self._config.volume_climax_max_entry_distance_below_high_pct,
+                rejection_ok=float(lifecycle_metadata.get("rejection_pct") or 0.0) >= self._config.volume_climax_min_rejection_pct,
+                liquidity_ok=features.liquidity_available and not bool(lifecycle_metadata.get("liquidity_warning")),
+                entry_distance_ok=float(lifecycle_metadata.get("entry_distance_below_high_pct") or 999.0) <= self._config.volume_climax_max_entry_distance_below_high_pct,
             )
             db_revision, _ = self._repository.upsert_shadow_root_event(
                 root_event_id=root_event_id,
@@ -575,7 +582,8 @@ class ShortSignalBot:
             )
             lifecycle_shadow.event_revision = db_revision
             event_revision = db_revision
-            lifecycle_attempt_id = f"{root_event_id}:r{db_revision}:a1"
+            lifecycle_attempt_id = volume_climax_attempt_id(root_event_id, db_revision)
+            shadow_attempt_id = lifecycle_attempt_id
             snapshot.update({
                 "volume_climax_latest_high": lifecycle_shadow.latest_high,
                 "volume_climax_latest_high_at": lifecycle_shadow.latest_high_at.isoformat(),
@@ -593,7 +601,7 @@ class ShortSignalBot:
                 root_event_id=root_event_id,
                 observed_at=features.asof,
                 local_retest_high=lifecycle_shadow.latest_high,
-                breakdown_level=float(evaluation.metadata.get("breakout_reference") or lifecycle_shadow.latest_high * 0.995),
+                breakdown_level=float(lifecycle_metadata.get("breakout_reference") or lifecycle_shadow.latest_high * 0.995),
                 attempt_state=attempt_state,
                 attempt_trigger="volume_climax_lifecycle",
                 confirmation_expires_at=lifecycle_shadow.confirmation_started_at + timedelta(minutes=self._config.volume_climax_confirmation_window_minutes),
@@ -616,8 +624,7 @@ class ShortSignalBot:
                     model_version="climax-lifecycle-v1-shadow",
                     details={"veto_reasons": lifecycle_shadow.veto_reasons},
                 )
-        shadow_attempt_id: str | None = None
-        if self._config.climax_root_event_tracking_enabled:
+        if self._config.climax_root_event_tracking_enabled and lifecycle_shadow is None:
             if shadow_evaluation is not None and shadow_evaluation.metadata.get("post_high_retest_high") is not None:
                 shadow_data = shadow_evaluation.metadata
                 shadow_attempt_id = f"{root_event_id}:r{event_revision}:a1"
@@ -653,6 +660,21 @@ class ShortSignalBot:
         passed_conditions = [key for key, value in evaluation.metadata.items() if isinstance(value, bool) and value]
         lifecycle_shadow_decision = lifecycle_shadow.state if lifecycle_shadow is not None else None
         lifecycle_shadow_vetoes = lifecycle_shadow.veto_reasons if lifecycle_shadow is not None else None
+        lifecycle_decision_delta = (
+            "LIVE_REJECTED_SHADOW_FALLBACK_READY"
+            if lifecycle_shadow is not None and not evaluation.actionable and lifecycle_shadow.state == "FALLBACK_READY"
+            else None
+        )
+        evaluation_features = asdict(features)
+        evaluation_features["climax_evaluation"] = {
+            "selected_subtype": evaluation.metadata.get("strategy_subtype"),
+            "selected_score": evaluation.score,
+            "selected_grade": evaluation.grade,
+            "selected_veto_reasons": list(evaluation.veto_reasons),
+            "volume_climax_observed": bool(evaluation.metadata.get("volume_climax_observed")),
+            "volume_climax_candidate": bool(evaluation.metadata.get("volume_climax_candidate")),
+            "volume_climax_metadata": evaluation.metadata.get("volume_climax_metadata"),
+        }
         evaluation_id = self._repository.record_climax_evaluation(
             evaluation_time=evaluated_at,
             symbol=symbol,
@@ -690,7 +712,7 @@ class ShortSignalBot:
                 "change_pct": features.oi_change_pct,
                 "reasons": features.derivatives_reasons,
             },
-            features=asdict(features),
+            features=evaluation_features,
             lifecycle_state="ACTIONABLE" if evaluation.actionable else "REJECTED",
             telegram_eligible=evaluation.actionable,
             runtime_instance_id=self._runtime_instance_id,
@@ -707,13 +729,13 @@ class ShortSignalBot:
             live_veto_reasons=evaluation.veto_reasons,
             shadow_decision=lifecycle_shadow_decision or (("ACTIONABLE" if shadow_evaluation and shadow_evaluation.actionable else "REJECTED") if shadow_evaluation else None),
             shadow_veto_reasons=lifecycle_shadow_vetoes if lifecycle_shadow is not None else (shadow_evaluation.veto_reasons if shadow_evaluation else None),
-            decision_delta=_decision_delta(evaluation, shadow_evaluation),
+            decision_delta=lifecycle_decision_delta or _decision_delta(evaluation, shadow_evaluation),
             shadow_hypothetical_entry_price=(features.price if shadow_evaluation and shadow_evaluation.actionable else None),
             shadow_hypothetical_grade=shadow_evaluation.grade if shadow_evaluation else None,
             shadow_hypothetical_score=shadow_evaluation.score if shadow_evaluation else None,
             shadow_removed_vetoes=(sorted(set(evaluation.veto_reasons) - set(shadow_evaluation.veto_reasons)) if shadow_evaluation else None),
         )
-        if self._config.climax_root_event_tracking_enabled:
+        if self._config.climax_root_event_tracking_enabled and lifecycle_shadow is None:
             lifecycle_model_version = str((shadow_evaluation.metadata if shadow_evaluation else evaluation.metadata).get("model_version", "climax-v1"))
             if shadow_attempt_id is None:
                 self._repository.record_attempt_correlation_missing(

@@ -39,6 +39,10 @@ class VolumeClimaxLifecycle:
     expired: bool = False
 
 
+def volume_climax_attempt_id(root_event_id: str, event_revision: int) -> str:
+    return f"volume_climax:{root_event_id}:r{event_revision}:a1"
+
+
 def advance_volume_climax_lifecycle(
     *,
     root_created_at: datetime,
@@ -52,6 +56,7 @@ def advance_volume_climax_lifecycle(
     closed_candles_after_high: int,
     max_lifetime_minutes: int,
     confirmation_window_minutes: int,
+    min_closed_candles_after_high: int = 2,
     price_acceleration_resumed: bool = False,
     active_short_squeeze: bool = False,
     oi_continuation: bool = False,
@@ -98,7 +103,7 @@ def advance_volume_climax_lifecycle(
 
     reasons: list[str] = []
     confirmation_age_minutes = (observed_at - confirmation_started_at).total_seconds() / 60
-    if closed_candles_after_high < 2:
+    if closed_candles_after_high < min_closed_candles_after_high:
         reasons.append("insufficient_closed_candles_after_high")
     if confirmation_age_minutes < confirmation_window_minutes:
         reasons.append("confirmation_window_open")
@@ -141,10 +146,17 @@ def evaluate_climax(
     The optional extension arguments are used only by V3B shadow evaluation;
     defaults preserve the live evaluator semantics exactly.
     """
-    base = _common_metadata(state, features, frame)
+    base = _common_metadata(
+        state,
+        features,
+        frame,
+        confirmation_window_minutes=getattr(config, "volume_climax_confirmation_window_minutes", 3),
+    )
     candidates: list[ClimaxEvaluation] = []
+    volume_candidate: ClimaxEvaluation | None = None
     if config.volume_climax_unwind_enabled:
-        candidates.append(_volume_climax(base, state, features, config))
+        volume_candidate = _volume_climax(base, state, features, config)
+        candidates.append(volume_candidate)
     if config.low_volume_extension_enabled:
         candidates.append(
             _low_volume(
@@ -156,16 +168,29 @@ def evaluate_climax(
                 current_ret5_gate_enabled=current_ret5_gate_enabled,
             )
         )
+    def with_volume_context(selected: ClimaxEvaluation) -> ClimaxEvaluation:
+        if volume_candidate is not None and volume_candidate.score >= config.climax_min_signal_score:
+            selected.metadata["volume_climax_observed"] = True
+            selected.metadata["volume_climax_candidate"] = not volume_candidate.veto_reasons
+            selected.metadata["volume_climax_metadata"] = dict(volume_candidate.metadata)
+        return selected
+
     valid = [item for item in candidates if item.actionable]
     if valid:
-        return max(valid, key=lambda item: item.score)
+        return with_volume_context(max(valid, key=lambda item: item.score))
     vetoed = [item for item in candidates if item.veto_reasons]
     if vetoed:
-        return max(vetoed, key=lambda item: item.score)
+        return with_volume_context(max(vetoed, key=lambda item: item.score))
     return ClimaxEvaluation(None, 0, "C", base, ["no_climax_admission"], [])
 
 
-def _common_metadata(state: EventState, features: SymbolFeatures, frame: pd.DataFrame) -> dict[str, Any]:
+def _common_metadata(
+    state: EventState,
+    features: SymbolFeatures,
+    frame: pd.DataFrame,
+    *,
+    confirmation_window_minutes: int = 3,
+) -> dict[str, Any]:
     timestamps = pd.Series(pd.to_datetime(frame["timestamp"], utc=True, errors="coerce"), index=frame.index) if "timestamp" in frame else pd.Series(pd.to_datetime(frame.index, utc=True, errors="coerce"), index=frame.index)
     asof_utc = pd.Timestamp(features.asof).tz_convert("UTC")
     latest_closed = frame.loc[timestamps <= asof_utc].copy()
@@ -183,7 +208,7 @@ def _common_metadata(state: EventState, features: SymbolFeatures, frame: pd.Data
     data_after_high = latest_closed.loc[timestamps.loc[latest_closed.index] > pd.Timestamp(state.event_high_time).tz_convert("UTC")] if state.event_high_time else latest_closed.iloc[0:0]
     post_high_high = float(data_after_high["high"].max()) if not data_after_high.empty else None
     if state.event_high_time:
-        confirmation_end = pd.Timestamp(state.event_high_time).tz_convert("UTC") + pd.Timedelta(minutes=3)
+        confirmation_end = pd.Timestamp(state.event_high_time).tz_convert("UTC") + pd.Timedelta(minutes=confirmation_window_minutes)
         confirmation_window = data_after_high.loc[timestamps.loc[data_after_high.index] <= confirmation_end]
     else:
         confirmation_window = data_after_high.iloc[0:0]
@@ -255,7 +280,9 @@ def _volume_climax(base: dict[str, Any], state: EventState, features: SymbolFeat
         vetoes.append("entry_too_far_from_high")
     score = _score([features.ret_5m >= config.volume_climax_min_price_change_5m_pct, volume_ratio >= config.volume_climax_min_volume_ratio or features.vol_zscore_30m >= config.volume_climax_min_volume_zscore, (features.oi_change_pct or 0) < config.volume_climax_max_oi_change_5m_pct, data["rejection_pct"] >= config.volume_climax_min_rejection_pct, features.latest_failed_retest])
     grade = _grade(score)
-    if features.liquidity_available and _liquidity_blocked(features, config, climax=True):
+    if not features.liquidity_available:
+        vetoes.append("liquidity_not_confirmed")
+    elif _liquidity_blocked(features, config, climax=True):
         vetoes.append("climax_liquidity_block")
     elif features.liquidity_available and _liquidity_warning(features, config):
         data["liquidity_warning"] = True
@@ -339,7 +366,9 @@ def _low_volume(
         vetoes.append("entry_too_far_from_high")
     score = _score([bool(state.event_id), ratio <= config.low_volume_max_current_previous_volume_ratio, efficiency <= config.low_volume_max_volume_efficiency_ratio, close_below_breakout, lower_high and failed_retest, micro_break, features.oi_change_pct is None or features.oi_change_pct < 0])
     grade = _grade(score)
-    if features.liquidity_available and _liquidity_blocked(features, config, climax=True):
+    if not features.liquidity_available:
+        vetoes.append("liquidity_not_confirmed")
+    elif _liquidity_blocked(features, config, climax=True):
         vetoes.append("climax_liquidity_block")
     elif features.liquidity_available and _liquidity_warning(features, config):
         data["liquidity_warning"] = True

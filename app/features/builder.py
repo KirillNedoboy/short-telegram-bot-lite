@@ -217,10 +217,17 @@ def _extract_liquidity(liquidity: Mapping[str, Any] | None) -> dict[str, Any]:
             "orderbook_depth_usdt_2pct": None,
             "liquidity_available": False,
         }
+    required = (
+        "spread_pct",
+        "slippage_pct",
+        "orderbook_depth_usdt_1pct",
+        "orderbook_depth_usdt_2pct",
+    )
+    liquidity_available = all(liquidity.get(key) is not None for key in required)
     return {
         "spread_pct": liquidity.get("spread_pct"),
         "slippage_pct": liquidity.get("slippage_pct"),
         "orderbook_depth_usdt_1pct": liquidity.get("orderbook_depth_usdt_1pct"),
         "orderbook_depth_usdt_2pct": liquidity.get("orderbook_depth_usdt_2pct"),
-        "liquidity_available": True,
+        "liquidity_available": liquidity_available,
     }

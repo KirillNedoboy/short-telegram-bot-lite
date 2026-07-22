@@ -17,6 +17,17 @@ def test_signal_engine_emits_aggressive_signal(make_event_state, make_features) 
     assert decision.score >= 80
 
 
+def test_signal_engine_blocks_actionable_signal_when_liquidity_missing(make_event_state, make_features) -> None:
+    engine = SignalEngine(AppConfig())
+    state = make_event_state(state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8)
+    zone = ShortZone(low=110.5, high=113.8, mode="event_range")
+    features = make_features(price=112.0, inside_short_zone_flag=True, liquidity_available=False)
+
+    decision = engine.evaluate(state, features, zone, features.asof)
+
+    assert decision is None
+
+
 def test_signal_engine_delays_signal_when_breakout_risk_is_active(make_event_state, make_features) -> None:
     engine = SignalEngine(AppConfig())
     state = make_event_state(state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8)
@@ -151,7 +162,7 @@ def test_signal_engine_sends_watch_for_moderately_weak_rejection(make_event_stat
     assert "Rejection is moderately below actionable threshold." in decision.risk_flags
 
 
-def test_signal_engine_downgrades_missing_liquidity_to_b(make_event_state, make_features) -> None:
+def test_signal_engine_blocks_missing_liquidity(make_event_state, make_features) -> None:
     engine = SignalEngine(AppConfig())
     state = make_event_state(state=EventStatus.PULLBACK_OBSERVED, zone_low=110.5, zone_high=113.8)
     zone = ShortZone(low=110.5, high=113.8, mode="event_range")
@@ -159,9 +170,7 @@ def test_signal_engine_downgrades_missing_liquidity_to_b(make_event_state, make_
 
     decision = engine.evaluate(state, features, zone, features.asof)
 
-    assert decision is not None
-    assert decision.grade == "B"
-    assert "Liquidity confirmation unavailable." in decision.risk_flags
+    assert decision is None
 
 
 def test_signal_engine_suppresses_c_grade(make_event_state, make_features) -> None:

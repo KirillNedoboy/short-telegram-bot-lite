@@ -257,7 +257,7 @@ def _watch_volume_threshold(config: AppConfig) -> float:
 
 def _liquidity_block_level(features: SymbolFeatures, config: AppConfig) -> str:
     if not features.liquidity_available:
-        return "ok"
+        return "block"
     moderate_failures = 0
     severe_failures = 0
     if features.spread_pct is not None and features.spread_pct > config.max_spread_pct:
