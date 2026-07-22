@@ -37,3 +37,7 @@ build/
 
 # Local exports and generated artifacts
 exports/
+
+# Deprecated machine-specific deployment helpers
+scripts/deploy_paramiko.py
+scripts/restart_unit_paramiko.py
