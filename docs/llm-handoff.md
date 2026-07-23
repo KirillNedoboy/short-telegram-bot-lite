@@ -1,6 +1,6 @@
 # LLM handoff guide
 
-Use this file as the entry point when giving the repository to another LLM.
+Use `docs/project-brief.md` as the primary project/strategy/safety overview when giving the repository to another LLM. This file remains the compact procedural entry point.
 
 ## Mission
 

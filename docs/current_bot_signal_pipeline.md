@@ -193,31 +193,19 @@ This is the effective signal path from live market data to Telegram and later to
      - current code has `grade`, not a separate `tier`
      - `trigger_window`, `signal_type`, and `grade` are different concepts
 
-18. **Format Telegram payload**
-   - File: `app/signals/formatter.py`
-   - Function: `format_signal_message()`
-   - Inputs:
-     - symbol
-     - signal type
-     - signal time localized by config timezone
-     - short zone
-     - grade
-     - score
-     - reasons
-     - translated risk flags
-
-19. **Send Telegram**
-   - File: `app/notifications/telegram.py`
-   - Function: `TelegramNotifier.send_signal()`
-   - Call site:
-     - `app/main.py`, `ShortSignalBot._process_symbol()`
-   - Important ordering:
-     - Telegram send happens before DB signal insert
-     - only a boolean send result is persisted, not the exact payload text
-
-20. **Persist signal**
+19. **Persist signal before attempting Telegram delivery**
    - File: `app/storage/repository.py`
    - Function: `BotRepository.save_signal()`
+   - The row is created with `telegram_sent=False` before transport is attempted.
+
+20. **Send Telegram and persist the delivery result**
+   - File: `app/notifications/telegram.py`
+   - Function: `TelegramNotifier.send_signal()`
+   - Call site: `app/main.py`
+   - After the attempt, `telegram_sent` is updated with the actual result.
+   - A notifier exception therefore leaves a durable row with `telegram_sent=False`.
+
+21. **Persist signal evidence**
    - Stored data includes:
      - signal metadata
      - event anchor values
