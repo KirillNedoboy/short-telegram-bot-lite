@@ -9,7 +9,7 @@ from app.config import AppConfig
 from app.domain import EventStatus, ShortZone
 from app.main import ShortSignalBot
 from app.storage.db import Database
-from app.storage.models import RejectStatModel, SignalModel, WatchCandidateModel
+from app.storage.models import RejectStatModel, SignalModel, TelegramDeliveryOutboxModel, WatchCandidateModel
 from app.storage.repository import BotRepository
 
 
@@ -64,6 +64,38 @@ class _FakeNotifier:
     async def send_alert(self, message: str) -> bool:
         self.messages.append(message)
         return True
+
+
+class _ExplodingNotifier(_FakeNotifier):
+    async def send_signal(self, _message: str) -> bool:
+        raise RuntimeError("telegram transport down")
+
+
+def test_notifier_failure_leaves_signal_retryable_in_outbox(tmp_path, make_event_state, make_signal_decision) -> None:
+    async def _run() -> tuple[object, object]:
+        database = Database(f"sqlite:///{tmp_path / 'delivery-failure.db'}")
+        database.create_all()
+        repository = BotRepository(database)
+        state = repository.upsert_event_state(make_event_state())
+        signal = repository.save_signal(
+            make_signal_decision(), state, telegram_sent=False, delivery_payload="immutable payload"
+        )
+        bot = ShortSignalBot(
+            config=AppConfig(),
+            repository=repository,
+            scanner=_FakeScanner(),
+            notifier=_ExplodingNotifier(),
+        )
+        sent = await bot._send_new_delivery(entity_type="SIGNAL", entity_id=signal.id)
+        with database.session() as session:
+            outbox = session.scalars(select(TelegramDeliveryOutboxModel)).one()
+            stored_signal = session.get(SignalModel, signal.id)
+        return sent, (stored_signal.telegram_sent, outbox.status, outbox.attempt_count, outbox.last_error)
+
+    sent, state = asyncio.run(_run())
+    assert sent is False
+    assert state[0] is False
+    assert state[1:] == ("RETRY", 1, "RuntimeError: telegram transport down")
 
 
 class _FailingRepository:

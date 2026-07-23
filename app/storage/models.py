@@ -22,6 +22,7 @@ class SignalModel(Base):
     """Saved Telegram signal or WATCH entry."""
 
     __tablename__ = "signals"
+    __table_args__ = (UniqueConstraint("symbol", "event_id", "strategy_subtype", "model_version", name="uq_signal_enriched_identity"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
@@ -85,6 +86,28 @@ class SignalOutcomeModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     signal: Mapped[SignalModel] = relationship(back_populates="outcome")
+
+
+class TelegramDeliveryOutboxModel(Base):
+    """Durable, at-least-once Telegram delivery intent for new rows only."""
+
+    __tablename__ = "telegram_delivery_outbox"
+    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_telegram_delivery_idempotency_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entity_type: Mapped[str] = mapped_column(String(16), index=True)
+    entity_id: Mapped[int] = mapped_column(Integer, index=True)
+    channel: Mapped[str] = mapped_column(String(32), default="signal_chat")
+    payload: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class WatchCandidateModel(Base):

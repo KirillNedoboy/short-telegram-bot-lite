@@ -180,10 +180,58 @@ class ShortSignalBot:
                 self._logger.error("Shadow lifecycle reconciliation failed; runtime evidence is degraded")
             elif any(reconciliation.values()):
                 self._logger.warning("Shadow lifecycle reconciliation | %s", reconciliation)
+        await self._drain_delivery_outbox(limit=5)
         if self._config.climax_short_enabled and self._config.climax_fast_monitor_enabled:
             self._fast_monitor_running = True
             self._fast_monitor_task = asyncio.create_task(self._run_fast_monitor(), name="climax-fast-monitor")
             self._logger.info("Climax strategies registered | fast_monitor=enabled poll=%ss max_symbols=%s", self._config.climax_fast_poll_sec, self._config.climax_max_active_symbols)
+
+    async def _deliver_outbox_item(self, delivery: dict[str, object]) -> bool:
+        delivery_id = int(delivery["id"])
+        try:
+            sent = await self._notifier.send_signal(str(delivery["payload"]))
+        except Exception as exc:
+            self._repository.mark_delivery_retry(
+                delivery_id,
+                error=f"{type(exc).__name__}: {exc}",
+                next_attempt_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            )
+            self._logger.warning("Telegram delivery retry scheduled | outbox_id=%s error=%s", delivery_id, type(exc).__name__)
+            return False
+        if sent:
+            self._repository.mark_delivery_sent(delivery_id)
+            return True
+        self._repository.mark_delivery_retry(
+            delivery_id,
+            error="telegram_send_returned_false",
+            next_attempt_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        return False
+
+    async def _drain_delivery_outbox(self, *, limit: int = 5) -> int:
+        claimed = self._repository.claim_due_deliveries(
+            datetime.now(timezone.utc),
+            limit=limit,
+            lease_seconds=120,
+        )
+        delivered = 0
+        for delivery in claimed:
+            if await self._deliver_outbox_item(delivery):
+                delivered += 1
+        return delivered
+
+    async def _send_new_delivery(self, *, entity_type: str, entity_id: int) -> bool:
+        """Send a newly persisted item immediately while retaining durable retry state."""
+        claimed = self._repository.claim_due_deliveries(
+            datetime.now(timezone.utc),
+            limit=1,
+            lease_seconds=120,
+            entity_type=entity_type,
+            entity_id=entity_id,
+        )
+        for delivery in claimed:
+            return await self._deliver_outbox_item(delivery)
+        return False
 
     async def shutdown(self) -> None:
         self._fast_monitor_running = False
@@ -202,6 +250,7 @@ class ShortSignalBot:
         try:
             if not await self._ensure_storage_healthy("cycle"):
                 return []
+            await self._drain_delivery_outbox(limit=5)
             active_states = self._state_store.load_active()
             snapshots = await self._scanner.fetch_market_snapshots()
             shortlist = self._scanner.shortlist(snapshots)
@@ -910,9 +959,11 @@ class ShortSignalBot:
                     if not fresh_eval.actionable or fresh_eval.subtype != "LOW_VOLUME_EXTENSION_FAILURE":
                         self._logger.info("Climax delivery veto: fresh_admission_failed symbol=%s reasons=%s", symbol, fresh_eval.veto_reasons)
                         return None
-        record = self._repository.save_signal(decision, state, telegram_sent=False)
-        telegram_sent = await self._notifier.send_signal(format_signal_message(decision, self._config.timezone))
-        self._repository.update_signal_telegram_status(record.id, telegram_sent)
+        payload = format_signal_message(decision, self._config.timezone)
+        record = self._repository.save_signal(decision, state, telegram_sent=False, delivery_payload=payload)
+        telegram_sent = await self._send_new_delivery(entity_type="SIGNAL", entity_id=record.id)
+        if not telegram_sent:
+            self._logger.warning("Telegram delivery pending/retry | signal_id=%s", record.id)
         state = self._pullback_tracker.mark_signal_sent(state, signal_id=record.id, when=features.asof)
         self._state_store.save(state)
         self._remove_climax_candidate(symbol, state.event_id, reason="signal_created")
@@ -1015,19 +1066,23 @@ class ShortSignalBot:
             watch_type = _watch_delivery_type(decision)
             if _watch_already_emitted(state, watch_type=watch_type):
                 return None, state
-            candidate = self._repository.save_watch_candidate(decision, state, telegram_sent=False)
+            delivery_enabled = self._config.send_watch_to_telegram and self._watch_sent_in_cycle < self._config.watch_max_per_cycle
+            payload = format_signal_message(decision, self._config.timezone) if delivery_enabled else None
+            candidate = self._repository.save_watch_candidate(decision, state, telegram_sent=False, delivery_payload=payload)
             telegram_sent = False
-            if self._config.send_watch_to_telegram and self._watch_sent_in_cycle < self._config.watch_max_per_cycle:
-                telegram_sent = await self._notifier.send_signal(format_signal_message(decision, self._config.timezone))
+            if delivery_enabled:
+                telegram_sent = await self._send_new_delivery(entity_type="WATCH", entity_id=candidate.id)
                 if telegram_sent:
                     self._watch_sent_in_cycle += 1
             self._repository.update_watch_telegram_status(candidate.id, telegram_sent)
             _mark_watch_emitted(state, watch_type=watch_type)
             return decision, state
 
-        record = self._repository.save_signal(decision, state, telegram_sent=False)
-        telegram_sent = await self._notifier.send_signal(format_signal_message(decision, self._config.timezone))
-        self._repository.update_signal_telegram_status(record.id, telegram_sent)
+        payload = format_signal_message(decision, self._config.timezone)
+        record = self._repository.save_signal(decision, state, telegram_sent=False, delivery_payload=payload)
+        telegram_sent = await self._send_new_delivery(entity_type="SIGNAL", entity_id=record.id)
+        if not telegram_sent:
+            self._logger.warning("Telegram delivery pending/retry | signal_id=%s", record.id)
         state = self._pullback_tracker.mark_signal_sent(state, signal_id=record.id, when=now)
         return decision, state
 
@@ -1107,12 +1162,15 @@ class ShortSignalBot:
             data_quality_warnings=[],
             logged_at=now,
         )
+        delivery_enabled = self._config.send_watch_to_telegram and self._watch_sent_in_cycle < self._config.watch_max_per_cycle
+        payload = format_signal_message(decision, self._config.timezone) if delivery_enabled else None
+        candidate = self._repository.save_watch_candidate(decision, state, telegram_sent=False, delivery_payload=payload)
         telegram_sent = False
-        if self._config.send_watch_to_telegram and self._watch_sent_in_cycle < self._config.watch_max_per_cycle:
-            telegram_sent = await self._notifier.send_signal(format_signal_message(decision, self._config.timezone))
+        if delivery_enabled:
+            telegram_sent = await self._send_new_delivery(entity_type="WATCH", entity_id=candidate.id)
             if telegram_sent:
                 self._watch_sent_in_cycle += 1
-        self._repository.save_watch_candidate(decision, state, telegram_sent)
+        self._repository.update_watch_telegram_status(candidate.id, telegram_sent)
         return decision
 
     async def _fetch_optional_liquidity(self, symbol: str, price: float) -> dict[str, object]:

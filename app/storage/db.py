@@ -114,6 +114,14 @@ class Database:
                     if column_name in existing:
                         continue
                     connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl_type}")
+            if "signals" in columns_by_table:
+                index_names = {index["name"] for index in inspect(self.engine).get_indexes("signals")}
+                constraint_names = {constraint["name"] for constraint in inspect(self.engine).get_unique_constraints("signals")}
+                if "uq_signal_enriched_identity" not in index_names and "uq_signal_enriched_identity" not in constraint_names:
+                    connection.exec_driver_sql(
+                        "CREATE UNIQUE INDEX uq_signal_enriched_identity "
+                        "ON signals(symbol, event_id, strategy_subtype, model_version)"
+                    )
 
     @contextmanager
     def session(self) -> Iterator[Session]:

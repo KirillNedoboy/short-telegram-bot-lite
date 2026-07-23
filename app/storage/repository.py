@@ -33,6 +33,7 @@ from app.storage.models import (
     MarketScanSymbolResultModel,
     SignalModel,
     SignalOutcomeModel,
+    TelegramDeliveryOutboxModel,
     WatchCandidateModel,
 )
 
@@ -257,7 +258,13 @@ class BotRepository:
         state.expires_at = when
         return self.upsert_event_state(state)
 
-    def save_signal(self, decision: SignalDecision, event_state: EventState, telegram_sent: bool) -> SignalRecord:
+    def save_signal(
+        self,
+        decision: SignalDecision,
+        event_state: EventState,
+        telegram_sent: bool,
+        delivery_payload: str | None = None,
+    ) -> SignalRecord:
         if decision.signal_type.value == "Watch":
             raise ValueError("WATCH decisions must be stored via save_watch_candidate")
         features = decision.features_snapshot
@@ -315,6 +322,15 @@ class BotRepository:
             )
             session.add(model)
             session.flush()
+            if delivery_payload is not None:
+                session.add(
+                    TelegramDeliveryOutboxModel(
+                        entity_type="SIGNAL",
+                        entity_id=model.id,
+                        payload=delivery_payload,
+                        idempotency_key=f"telegram:signal:{model.id}",
+                    )
+                )
             session.refresh(model)
             return _signal_from_model(model)
 
@@ -345,7 +361,13 @@ class BotRepository:
             ).limit(1)
             return session.scalar(stmt) is not None
 
-    def save_watch_candidate(self, decision: SignalDecision, event_state: EventState, telegram_sent: bool) -> WatchCandidateRecord:
+    def save_watch_candidate(
+        self,
+        decision: SignalDecision,
+        event_state: EventState,
+        telegram_sent: bool,
+        delivery_payload: str | None = None,
+    ) -> WatchCandidateRecord:
         features = decision.features_snapshot
         with self._db.session() as session:
             model = WatchCandidateModel(
@@ -395,8 +417,116 @@ class BotRepository:
             )
             session.add(model)
             session.flush()
+            if delivery_payload is not None:
+                session.add(
+                    TelegramDeliveryOutboxModel(
+                        entity_type="WATCH",
+                        entity_id=model.id,
+                        payload=delivery_payload,
+                        idempotency_key=f"telegram:watch:{model.id}",
+                    )
+                )
             session.refresh(model)
             return _watch_candidate_from_model(model)
+
+    def claim_due_deliveries(
+        self,
+        now: datetime,
+        *,
+        limit: int,
+        lease_seconds: int,
+        entity_type: str | None = None,
+        entity_id: int | None = None,
+    ) -> list[dict[str, object]]:
+        """Claim a bounded batch of pending/retry deliveries for at-least-once send."""
+        with self._db.session() as session:
+            session.query(TelegramDeliveryOutboxModel).filter(
+                TelegramDeliveryOutboxModel.status == "IN_FLIGHT",
+                TelegramDeliveryOutboxModel.lease_until <= now,
+            ).update(
+                {
+                    TelegramDeliveryOutboxModel.status: "RETRY",
+                    TelegramDeliveryOutboxModel.lease_until: None,
+                    TelegramDeliveryOutboxModel.next_attempt_at: now,
+                },
+                synchronize_session=False,
+            )
+            conditions = [
+                TelegramDeliveryOutboxModel.status.in_(["PENDING", "RETRY"]),
+                TelegramDeliveryOutboxModel.next_attempt_at <= now,
+            ]
+            if entity_type is not None:
+                conditions.append(TelegramDeliveryOutboxModel.entity_type == entity_type)
+            if entity_id is not None:
+                conditions.append(TelegramDeliveryOutboxModel.entity_id == entity_id)
+            stmt = (
+                select(TelegramDeliveryOutboxModel)
+                .where(*conditions)
+                .order_by(TelegramDeliveryOutboxModel.id)
+                .limit(limit)
+            )
+            claimed: list[dict[str, object]] = []
+            lease_until = now + timedelta(seconds=lease_seconds)
+            for model in session.scalars(stmt).all():
+                model.status = "IN_FLIGHT"
+                model.attempt_count += 1
+                model.last_attempt_at = now
+                model.lease_until = lease_until
+                claimed.append({"id": model.id, "entity_type": model.entity_type, "entity_id": model.entity_id, "payload": model.payload, "attempt_count": model.attempt_count})
+            return claimed
+
+    def delivery_id_for_entity(self, entity_type: str, entity_id: int) -> int:
+        with self._db.session() as session:
+            stmt = select(TelegramDeliveryOutboxModel.id).where(
+                TelegramDeliveryOutboxModel.entity_type == entity_type,
+                TelegramDeliveryOutboxModel.entity_id == entity_id,
+                TelegramDeliveryOutboxModel.status != "SENT",
+            )
+            delivery_id = session.scalar(stmt)
+            if delivery_id is None:
+                raise LookupError(f"delivery not found: {entity_type}:{entity_id}")
+            return int(delivery_id)
+
+    def mark_delivery_sent(self, outbox_id: int) -> None:
+        """Atomically mark outbox and its source entity as delivered."""
+        with self._db.session() as session:
+            outbox = session.get(TelegramDeliveryOutboxModel, outbox_id)
+            if outbox is None:
+                raise LookupError(f"delivery outbox not found: {outbox_id}")
+            now = datetime.now(timezone.utc)
+            outbox.status = "SENT"
+            outbox.sent_at = now
+            outbox.lease_until = None
+            if outbox.entity_type == "SIGNAL":
+                source = session.get(SignalModel, outbox.entity_id)
+            elif outbox.entity_type == "WATCH":
+                source = session.get(WatchCandidateModel, outbox.entity_id)
+            else:
+                raise ValueError(f"unknown delivery entity type: {outbox.entity_type}")
+            if source is None:
+                raise LookupError(f"delivery source not found: {outbox.entity_type}:{outbox.entity_id}")
+            source.telegram_sent = True
+
+    def mark_delivery_retry(self, outbox_id: int, *, error: str, next_attempt_at: datetime) -> None:
+        """Persist a bounded retry or dead-letter a delivery after five attempts."""
+        with self._db.session() as session:
+            outbox = session.get(TelegramDeliveryOutboxModel, outbox_id)
+            if outbox is None:
+                raise LookupError(f"delivery outbox not found: {outbox_id}")
+            outbox.status = "DEAD" if outbox.attempt_count >= 5 else "RETRY"
+            outbox.next_attempt_at = next_attempt_at
+            outbox.lease_until = None
+            outbox.last_error = error[:1000]
+
+    def count_legacy_unsent_signals(self) -> int:
+        """Count historical unsent rows intentionally excluded from the new outbox."""
+        with self._db.session() as session:
+            stmt = select(func.count(SignalModel.id)).where(
+                SignalModel.telegram_sent.is_(False),
+                SignalModel.strategy_subtype.is_(None),
+                SignalModel.model_version.is_(None),
+            )
+            return int(session.scalar(stmt) or 0)
 
     def list_signals_missing_outcomes(
         self,
