@@ -13,6 +13,7 @@ class ServiceHealth:
     cycles: int = 0
     signals_sent: int = 0
     errors: int = 0
+    strategy_observation_write_failures: int = 0
     last_cycle_started_at: datetime | None = None
     last_cycle_finished_at: datetime | None = None
     last_error_at: datetime | None = None
@@ -30,3 +31,6 @@ class ServiceHealth:
     def on_error(self) -> None:
         self.errors += 1
         self.last_error_at = datetime.now(timezone.utc)
+
+    def on_strategy_observation_write_failure(self, count: int = 1) -> None:
+        self.strategy_observation_write_failures += count

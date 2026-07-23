@@ -10,6 +10,8 @@ Live V1 strategies are `BASELINE_PULLBACK`, `VOLUME_CLIMAX_UNWIND`, and `LOW_VOL
 
 Telegram uses the persistent `telegram_delivery_outbox` with at-least-once delivery. A retry can duplicate a message after an ambiguous network acknowledgement.
 
+`strategy_observations` is a separate append-only research ledger. It records every enabled `CLIMAX_EXHAUSTION` evaluator branch for `INITIAL` and actual delivery-recheck phases, including rejected and low-score cases. It is best-effort telemetry: a write failure must not change live selection, signals, outbox delivery, or event state. `BASELINE_PULLBACK` is outside this first instrumentation scope.
+
 ## Read first
 
 1. `README.md` — purpose, quick start, and boundaries.

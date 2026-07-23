@@ -27,8 +27,22 @@ from app.market.bybit_client import BybitClient
 from app.market.scanner import MarketScanner
 from app.notifications.telegram import TelegramNotifier
 from app.notifications.throttling import ErrorThrottler
+from app.observability.strategy_observations import (
+    ObservationWriteResult,
+    ObservationWriteStatus,
+    StrategyObservation,
+    build_observation_evidence,
+    make_observation_idempotency_key,
+)
 from app.outcomes.tracker import OutcomeTracker
-from app.signals.climax import ClimaxEvaluation, advance_volume_climax_lifecycle, evaluate_climax, evaluate_climax_shadow, volume_climax_attempt_id
+from app.signals.climax import (
+    ClimaxEvaluation,
+    ClimaxEvaluationBundle,
+    advance_volume_climax_lifecycle,
+    evaluate_climax_bundle,
+    evaluate_climax_shadow,
+    volume_climax_attempt_id,
+)
 from app.signals.delivery_policy import live_delivery_enabled
 from app.signals.engine import SignalEngine
 from app.signals.formatter import format_signal_message
@@ -46,6 +60,30 @@ def _public_config_fingerprint(config: AppConfig) -> str:
         if not any(part in key.lower() for part in excluded) and key not in {"db_url", "signal_chat_id", "alerts_chat_id"}
     }
     encoded = json.dumps(public, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _strategy_config_fingerprint(config: AppConfig) -> str:
+    """Hash strategy-affecting configuration without operational settings."""
+
+    strategy_prefixes = (
+        "climax_",
+        "volume_climax_",
+        "low_volume_",
+        "derivatives_",
+        "max_spread_",
+        "max_slippage_",
+        "min_orderbook_depth_",
+        "enable_squeeze_guard",
+        "squeeze_guard_",
+    )
+    values = config.model_dump(mode="json")
+    strategy_values = {
+        key: value
+        for key, value in values.items()
+        if key.startswith(strategy_prefixes)
+    }
+    encoded = json.dumps(strategy_values, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -93,6 +131,7 @@ class ShortSignalBot:
         self._config = config
         self._runtime_instance_id = uuid.uuid4().hex
         self._config_fingerprint = _public_config_fingerprint(config)
+        self._strategy_config_hash = _strategy_config_fingerprint(config)
         self._logger = logging.getLogger(self.__class__.__name__)
         self._watch_sent_in_cycle = 0
         self._active_climax_pool: dict[tuple[str, str], _ClimaxCandidate] = {}
@@ -599,7 +638,8 @@ class ShortSignalBot:
             derivatives = await self._scanner.fetch_optional_derivatives(symbol)
             liquidity = await self._fetch_optional_liquidity(symbol, float(frame_1m["close"].iloc[-1]))
             features = self._feature_builder.build(symbol, frame_1m, state=state, derivatives=derivatives, liquidity=liquidity)
-        evaluation: ClimaxEvaluation = evaluate_climax(state, features, frame_1m, self._config)
+        bundle = evaluate_climax_bundle(state, features, frame_1m, self._config)
+        evaluation: ClimaxEvaluation = bundle.selected
         shadow_evaluation: ClimaxEvaluation | None = None
         if self._config.low_volume_frozen_initial_extension_enabled and self._config.low_volume_frozen_initial_extension_shadow_only:
             shadow_evaluation = evaluate_climax_shadow(state, features, frame_1m, self._config)
@@ -819,6 +859,19 @@ class ShortSignalBot:
             shadow_hypothetical_score=shadow_evaluation.score if shadow_evaluation else None,
             shadow_removed_vetoes=(sorted(set(evaluation.veto_reasons) - set(shadow_evaluation.veto_reasons)) if shadow_evaluation else None),
         )
+        observation_results = self._record_strategy_observations(
+            bundle,
+            evaluation_phase="INITIAL",
+            state=state,
+            features=features,
+            root_event_id=root_event_id,
+            event_revision=event_revision,
+            attempt_id=shadow_attempt_id,
+            evaluation_id=evaluation_id,
+            lifecycle_shadow=lifecycle_shadow,
+            observed_at=evaluated_at,
+        )
+        await self._report_strategy_observation_failures(observation_results)
         if evaluation.metadata.get("volume_climax_observed"):
             volume_metadata = dict(evaluation.metadata.get("volume_climax_metadata") or {})
             volume_candidate = bool(evaluation.metadata.get("volume_climax_candidate"))
@@ -926,8 +979,9 @@ class ShortSignalBot:
                     fresh_derivatives = await self._scanner.fetch_optional_derivatives(symbol)
                     fresh_liquidity = await self._fetch_optional_liquidity(symbol, float(fresh_frame["close"].iloc[-1]))
                     fresh_features = self._feature_builder.build(symbol, fresh_frame, state=state, derivatives=fresh_derivatives, liquidity=fresh_liquidity)
-                    fresh_eval = evaluate_climax(state, fresh_features, fresh_frame, self._config)
-                    self._repository.record_climax_evaluation(
+                    fresh_bundle = evaluate_climax_bundle(state, fresh_features, fresh_frame, self._config)
+                    fresh_eval = fresh_bundle.selected
+                    fresh_evaluation_id = self._repository.record_climax_evaluation(
                         evaluation_time=datetime.now(timezone.utc),
                         symbol=symbol,
                         strategy="CLIMAX_EXHAUSTION",
@@ -970,6 +1024,19 @@ class ShortSignalBot:
                         observed_at=fresh_features.asof,
                         market_asof=fresh_features.asof,
                     )
+                    observation_results = self._record_strategy_observations(
+                        fresh_bundle,
+                        evaluation_phase="PRE_DELIVERY_RECHECK",
+                        state=state,
+                        features=fresh_features,
+                        root_event_id=root_event_id,
+                        event_revision=event_revision,
+                        attempt_id=shadow_attempt_id,
+                        evaluation_id=fresh_evaluation_id,
+                        lifecycle_shadow=lifecycle_shadow,
+                        observed_at=datetime.now(timezone.utc),
+                    )
+                    await self._report_strategy_observation_failures(observation_results)
                     if not fresh_eval.actionable or fresh_eval.subtype != "LOW_VOLUME_EXTENSION_FAILURE":
                         self._logger.info("Climax delivery veto: fresh_admission_failed symbol=%s reasons=%s", symbol, fresh_eval.veto_reasons)
                         return None
@@ -989,6 +1056,132 @@ class ShortSignalBot:
         self._state_store.save(state)
         self._remove_climax_candidate(symbol, state.event_id, reason="signal_created")
         return decision
+
+    def _record_strategy_observations(
+        self,
+        bundle: ClimaxEvaluationBundle,
+        *,
+        evaluation_phase: str,
+        state: EventState,
+        features: SymbolFeatures,
+        root_event_id: str,
+        event_revision: int,
+        attempt_id: str | None,
+        evaluation_id: int | None,
+        lifecycle_shadow: object | None,
+        observed_at: datetime,
+    ) -> list[ObservationWriteResult]:
+        """Persist every enabled climax branch without affecting live evaluation."""
+
+        record_observation = getattr(self._repository, "record_strategy_observation", None)
+        if record_observation is None:
+            return []
+        run_id = uuid.uuid4().hex
+        results: list[ObservationWriteResult] = []
+        for strategy, branch_evaluation in bundle.branch_evaluations.items():
+            try:
+                snapshot = {
+                    "event": {
+                        "event_id": state.event_id,
+                        "root_event_id": root_event_id,
+                        "event_revision": event_revision,
+                        "event_high": state.event_high,
+                    },
+                    "evaluation": {
+                        "strategy": strategy,
+                        "evaluation_phase": evaluation_phase,
+                        "score": branch_evaluation.score,
+                        "grade": branch_evaluation.grade,
+                        "metadata": branch_evaluation.metadata,
+                        "blockers": branch_evaluation.veto_reasons,
+                        "warnings": branch_evaluation.data_quality,
+                    },
+                    "features": asdict(features),
+                }
+                evidence = build_observation_evidence(snapshot)
+                model_version = str(branch_evaluation.metadata.get("model_version", "climax-v1"))
+                idempotency_key = make_observation_idempotency_key(
+                    strategy_family="CLIMAX_EXHAUSTION",
+                    strategy=strategy,
+                    symbol=features.symbol,
+                    root_event_id=root_event_id,
+                    event_revision=event_revision,
+                    evaluation_phase=evaluation_phase,
+                    market_asof=features.asof,
+                    input_fingerprint=evidence.input_fingerprint,
+                    model_version=model_version,
+                    config_hash=self._strategy_config_hash,
+                )
+                observation = StrategyObservation(
+                    observation_id=uuid.uuid4().hex,
+                    idempotency_key=idempotency_key,
+                    run_id=run_id,
+                    runtime_instance_id=self._runtime_instance_id,
+                    strategy_family="CLIMAX_EXHAUSTION",
+                    strategy=strategy,
+                    evaluation_phase=evaluation_phase,
+                    symbol=features.symbol,
+                    root_event_id=root_event_id,
+                    event_revision=event_revision,
+                    attempt_id=attempt_id,
+                    evaluation_id=evaluation_id if branch_evaluation is bundle.selected else None,
+                    signal_id=None,
+                    observed_at=observed_at,
+                    exchange_time=None,
+                    market_asof=features.asof,
+                    live_decision=self._observation_live_decision(branch_evaluation, evaluation_phase),
+                    shadow_decision=self._observation_shadow_decision(strategy, lifecycle_shadow),
+                    score=branch_evaluation.score,
+                    blockers=list(branch_evaluation.veto_reasons),
+                    warnings=list(branch_evaluation.data_quality),
+                    market_price=features.price,
+                    event_high=branch_evaluation.metadata.get("event_high") or state.event_high,
+                    model_version=model_version,
+                    config_hash=self._strategy_config_hash,
+                    input_fingerprint=evidence.input_fingerprint,
+                    input_snapshot=evidence.snapshot,
+                )
+                results.append(record_observation(observation))
+            except Exception:
+                self._logger.exception(
+                    "strategy observation preparation failed strategy=%s symbol=%s root_event_id=%s",
+                    strategy,
+                    features.symbol,
+                    root_event_id,
+                )
+                results.append(ObservationWriteResult(ObservationWriteStatus.FAILED))
+        return results
+
+    @staticmethod
+    def _observation_live_decision(evaluation: ClimaxEvaluation, evaluation_phase: str) -> str:
+        if evaluation_phase == "EVENT_EXPIRED":
+            return "EXPIRED"
+        if evaluation.actionable:
+            return "ACTIONABLE"
+        if evaluation.veto_reasons:
+            return "BLOCKED"
+        return "CANDIDATE"
+
+    @staticmethod
+    def _observation_shadow_decision(strategy: str, lifecycle_shadow: object | None) -> str:
+        if strategy != "VOLUME_CLIMAX_UNWIND" or lifecycle_shadow is None:
+            return "NOT_EVALUATED"
+        state = getattr(lifecycle_shadow, "state", None)
+        if state in {"WATCHING", "FALLBACK_READY", "EXPIRED"}:
+            return state
+        return "REJECTED"
+
+    async def _report_strategy_observation_failures(self, results: list[ObservationWriteResult]) -> None:
+        failures = [result for result in results if result.status is ObservationWriteStatus.FAILED]
+        if not failures:
+            return
+        self._health.on_strategy_observation_write_failure(len(failures))
+        if not self._error_throttler.should_send("strategy_observation_ledger_write_failed"):
+            return
+        try:
+            await self._notifier.send_alert("Strategy observation ledger write failed; scanner delivery continues.")
+        except Exception:
+            self._logger.exception("strategy observation ledger failure alert could not be sent")
 
     async def _process_symbol(
         self,

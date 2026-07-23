@@ -200,6 +200,14 @@ This is the effective signal path from live market data to Telegram and later to
    - Live V1 delivery is allowed separately for `BASELINE_PULLBACK`, `VOLUME_CLIMAX_UNWIND`, and `LOW_VOLUME_EXTENSION_FAILURE`; all three shipped gates are `true`.
    - `VOLUME_CLIMAX_LIFECYCLE_SHADOW_V2` remains research telemetry and does not control V1 admission. WATCH delivery remains disabled by `send_watch_to_telegram=false`.
 
+19a. **Record independent climax observations**
+   - File: `app/main.py`
+   - Function: `ShortSignalBot._record_strategy_observations()`
+   - For each actual climax evaluator call, every enabled branch is written to `strategy_observations` before existing delivery side effects continue.
+   - Initial evaluations use `INITIAL`; LOW_VOLUME delivery validation uses a second bundle with `PRE_DELIVERY_RECHECK` before it can veto delivery.
+   - This is research-only telemetry. A failed write issues a rate-limited operational alert and does not alter the selected evaluation, signal, Telegram outbox, or event state.
+   - Scope is only `VOLUME_CLIMAX_UNWIND` and `LOW_VOLUME_EXTENSION_FAILURE`. `BASELINE_PULLBACK` is not yet instrumented.
+
 20. **Claim, send, and reconcile Telegram delivery**
    - File: `app/main.py`
    - Functions: `_send_new_delivery()`, `_drain_delivery_outbox()`, `_deliver_outbox_item()`

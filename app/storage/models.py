@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -275,6 +275,49 @@ class VolumeClimaxObservationModel(Base):
     attempt_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
 
 
+class StrategyObservationModel(Base):
+    """Append-only research denominator for strategy evaluator branches."""
+
+    __tablename__ = "strategy_observations"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_strategy_observation_idempotency_key"),
+        Index(
+            "ix_strategy_observations_family_strategy_observed_at",
+            "strategy_family",
+            "strategy",
+            "observed_at",
+        ),
+    )
+
+    observation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    run_id: Mapped[str] = mapped_column(String(64), index=True)
+    runtime_instance_id: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_family: Mapped[str] = mapped_column(String(64), index=True)
+    strategy: Mapped[str] = mapped_column(String(64), index=True)
+    evaluation_phase: Mapped[str] = mapped_column(String(32), index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    root_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    event_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempt_id: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    evaluation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    signal_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    exchange_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    market_asof: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    live_decision: Mapped[str] = mapped_column(String(32), index=True)
+    shadow_decision: Mapped[str] = mapped_column(String(32), index=True)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    blockers_json: Mapped[list] = mapped_column(JSON, default=list)
+    warnings_json: Mapped[list] = mapped_column(JSON, default=list)
+    market_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    event_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    model_version: Mapped[str] = mapped_column(String(64))
+    config_hash: Mapped[str] = mapped_column(String(64), index=True)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    input_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class ClimaxRootEventModel(Base):
     """Durable V3C root-event identity; shadow-only until explicitly activated."""
 
@@ -482,4 +525,3 @@ class MarketScanSymbolResultModel(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     runtime_instance_id: Mapped[str] = mapped_column(String(64), index=True)
     details_json: Mapped[dict] = mapped_column(JSON, default=dict)
-

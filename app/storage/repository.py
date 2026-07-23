@@ -12,10 +12,12 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import selectinload
 
 from app.domain import EventState, EventStatus, SignalDecision, SignalOutcome, SignalRecord, WatchCandidateRecord
 from app.market.coverage import coverage_percent, universe_fingerprint
+from app.observability.strategy_observations import ObservationWriteResult, ObservationWriteStatus, StrategyObservation
 from app.storage.db import Database
 from app.storage.models import (
     ClimaxEvaluationModel,
@@ -33,6 +35,7 @@ from app.storage.models import (
     MarketScanSymbolResultModel,
     SignalModel,
     SignalOutcomeModel,
+    StrategyObservationModel,
     TelegramDeliveryOutboxModel,
     WatchCandidateModel,
 )
@@ -587,6 +590,57 @@ class BotRepository:
             session.flush()
             session.refresh(model)
             return _outcome_from_model(model)
+
+    def record_strategy_observation(self, observation: StrategyObservation) -> ObservationWriteResult:
+        """Append one research observation without interrupting the scanner."""
+
+        try:
+            values = {
+                "observation_id": observation.observation_id,
+                "idempotency_key": observation.idempotency_key,
+                "run_id": observation.run_id,
+                "runtime_instance_id": observation.runtime_instance_id,
+                "strategy_family": observation.strategy_family,
+                "strategy": observation.strategy,
+                "evaluation_phase": observation.evaluation_phase,
+                "symbol": observation.symbol,
+                "root_event_id": observation.root_event_id,
+                "event_revision": observation.event_revision,
+                "attempt_id": observation.attempt_id,
+                "evaluation_id": observation.evaluation_id,
+                "signal_id": observation.signal_id,
+                "observed_at": observation.observed_at,
+                "exchange_time": observation.exchange_time,
+                "market_asof": observation.market_asof,
+                "live_decision": observation.live_decision,
+                "shadow_decision": observation.shadow_decision,
+                "score": observation.score,
+                "blockers_json": _json_ready(observation.blockers),
+                "warnings_json": _json_ready(observation.warnings),
+                "market_price": _nullable_float(observation.market_price),
+                "event_high": _nullable_float(observation.event_high),
+                "model_version": observation.model_version,
+                "config_hash": observation.config_hash,
+                "input_fingerprint": observation.input_fingerprint,
+                "input_snapshot_json": _json_ready(observation.input_snapshot),
+            }
+            with self._db.session() as session:
+                statement = sqlite_insert(StrategyObservationModel).values(**values).on_conflict_do_nothing(
+                    index_elements=["idempotency_key"]
+                )
+                result = session.execute(statement)
+                if result.rowcount:
+                    return ObservationWriteResult(ObservationWriteStatus.INSERTED, observation.observation_id)
+                return ObservationWriteResult(ObservationWriteStatus.DUPLICATE)
+        except Exception:
+            logger.exception(
+                "strategy observation ledger write failed family=%s strategy=%s symbol=%s root_event_id=%s",
+                observation.strategy_family,
+                observation.strategy,
+                observation.symbol,
+                observation.root_event_id,
+            )
+            return ObservationWriteResult(ObservationWriteStatus.FAILED)
 
     def record_volume_climax_observation(
         self,

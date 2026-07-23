@@ -25,6 +25,14 @@ class ClimaxEvaluation:
 
 
 @dataclass(slots=True)
+class ClimaxEvaluationBundle:
+    """All enabled climax branch evaluations and the unchanged selected result."""
+
+    selected: ClimaxEvaluation
+    branch_evaluations: dict[str, ClimaxEvaluation]
+
+
+@dataclass(slots=True)
 class VolumeClimaxLifecycle:
     """Shadow lifecycle decision for one root volume-climax event."""
 
@@ -147,6 +155,29 @@ def evaluate_climax(
     The optional extension arguments are used only by V3B shadow evaluation;
     defaults preserve the live evaluator semantics exactly.
     """
+    return evaluate_climax_bundle(
+        state,
+        features,
+        frame,
+        config,
+        frozen_initial_extension_pct=frozen_initial_extension_pct,
+        current_ret5_gate_enabled=current_ret5_gate_enabled,
+        strict_closed_candles=strict_closed_candles,
+    ).selected
+
+
+def evaluate_climax_bundle(
+    state: EventState,
+    features: SymbolFeatures,
+    frame: pd.DataFrame,
+    config: Any,
+    *,
+    frozen_initial_extension_pct: float | None = None,
+    current_ret5_gate_enabled: bool = True,
+    strict_closed_candles: bool = False,
+) -> ClimaxEvaluationBundle:
+    """Evaluate every enabled branch while retaining legacy selected behavior."""
+
     base = _common_metadata(
         state,
         features,
@@ -154,22 +185,24 @@ def evaluate_climax(
         confirmation_window_minutes=getattr(config, "volume_climax_confirmation_window_minutes", 3),
         strict_closed_candles=strict_closed_candles,
     )
+    branches: dict[str, ClimaxEvaluation] = {}
     candidates: list[ClimaxEvaluation] = []
     volume_candidate: ClimaxEvaluation | None = None
     if config.volume_climax_unwind_enabled:
         volume_candidate = _volume_climax(base, state, features, config)
+        branches["VOLUME_CLIMAX_UNWIND"] = volume_candidate
         candidates.append(volume_candidate)
     if config.low_volume_extension_enabled:
-        candidates.append(
-            _low_volume(
-                base,
-                state,
-                features,
-                config,
-                frozen_initial_extension_pct=frozen_initial_extension_pct,
-                current_ret5_gate_enabled=current_ret5_gate_enabled,
-            )
+        low_volume_candidate = _low_volume(
+            base,
+            state,
+            features,
+            config,
+            frozen_initial_extension_pct=frozen_initial_extension_pct,
+            current_ret5_gate_enabled=current_ret5_gate_enabled,
         )
+        branches["LOW_VOLUME_EXTENSION_FAILURE"] = low_volume_candidate
+        candidates.append(low_volume_candidate)
     def with_volume_context(selected: ClimaxEvaluation) -> ClimaxEvaluation:
         if volume_candidate is not None:
             selected.metadata["volume_climax_observed"] = True
@@ -183,11 +216,14 @@ def evaluate_climax(
 
     valid = [item for item in candidates if item.actionable]
     if valid:
-        return with_volume_context(max(valid, key=lambda item: item.score))
+        selected = with_volume_context(max(valid, key=lambda item: item.score))
+        return ClimaxEvaluationBundle(selected=selected, branch_evaluations=branches)
     vetoed = [item for item in candidates if item.veto_reasons]
     if vetoed:
-        return with_volume_context(max(vetoed, key=lambda item: item.score))
-    return with_volume_context(ClimaxEvaluation(None, 0, "C", base, ["no_climax_admission"], []))
+        selected = with_volume_context(max(vetoed, key=lambda item: item.score))
+        return ClimaxEvaluationBundle(selected=selected, branch_evaluations=branches)
+    selected = with_volume_context(ClimaxEvaluation(None, 0, "C", base, ["no_climax_admission"], []))
+    return ClimaxEvaluationBundle(selected=selected, branch_evaluations=branches)
 
 
 def _common_metadata(

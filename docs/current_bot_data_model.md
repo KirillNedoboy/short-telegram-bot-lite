@@ -9,6 +9,7 @@ Observed tables in the local snapshot:
 - `signals`
 - `signal_outcomes`
 - `event_states`
+- `strategy_observations`
 - `__db_heartbeat`
 
 Observed row counts in the local snapshot:
@@ -252,6 +253,26 @@ The `signals` row itself is append-only in current behavior.
 `TelegramDeliveryOutboxModel` is the durable delivery queue for newly emitted signal and WATCH rows. It stores `entity_type`, `entity_id`, `channel`, immutable `payload`, `idempotency_key`, `status`, `attempt_count`, `next_attempt_at`, `last_attempt_at`, `lease_until`, `sent_at`, `last_error`, and `created_at`.
 
 Delivery is at-least-once, not exactly-once: if Telegram accepts a request but the acknowledgement is lost, a retry can duplicate the message. Historical rows with `telegram_sent=false` are not backfilled into this table automatically.
+
+### `strategy_observations`
+
+Purpose:
+
+- append-only research denominator for evaluated strategy branches
+- currently records only the `CLIMAX_EXHAUSTION` family: `VOLUME_CLIMAX_UNWIND` and `LOW_VOLUME_EXTENSION_FAILURE`
+- does not change signal admission, thresholds, grades, Telegram delivery, or event state
+
+Each evaluator call writes one row for each enabled branch. `evaluation_phase` identifies the factual call: `INITIAL`, `PRE_DELIVERY_RECHECK`, or `EVENT_EXPIRED`. The independent decisions are stored as `live_decision` and `shadow_decision`; a low score, missing OI, liquidity block, or veto remains in the ledger.
+
+Identity and links:
+
+- `observation_id` is immutable; `run_id` and `runtime_instance_id` are diagnostic metadata.
+- `idempotency_key` is unique and is derived from strategy, root/revision, phase, market timestamp, evidence fingerprint, model version, and strategy config hash. Replaying the same observation returns a duplicate without changing the row.
+- `root_event_id`, `event_revision`, `attempt_id`, `evaluation_id`, and `signal_id` are nullable correlation links. This first package leaves `signal_id` null rather than modifying a row after delivery.
+
+Evidence is canonical JSON with a 32 KiB cap. Oversized input is replaced by a valid truncation marker containing the full fingerprint. Secrets and operational configuration are excluded. Failed ledger writes are counted and alert through the operational channel with rate limiting; they never block the scanner or create a signal/outbox row.
+
+`BASELINE_PULLBACK` is intentionally not instrumented yet.
 
 ## Denormalization Notes
 

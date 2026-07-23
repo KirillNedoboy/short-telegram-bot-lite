@@ -9,9 +9,10 @@ from sqlalchemy import select
 from app.config import AppConfig
 from app.domain import EventStatus, ShortZone, SignalType
 from app.main import ShortSignalBot
-from app.signals.climax import ClimaxEvaluation
+from app.observability.strategy_observations import ObservationWriteResult, ObservationWriteStatus
+from app.signals.climax import ClimaxEvaluation, ClimaxEvaluationBundle
 from app.storage.db import Database
-from app.storage.models import RejectStatModel, SignalModel, TelegramDeliveryOutboxModel, WatchCandidateModel
+from app.storage.models import RejectStatModel, SignalModel, StrategyObservationModel, TelegramDeliveryOutboxModel, WatchCandidateModel
 from app.storage.repository import BotRepository
 
 
@@ -26,6 +27,15 @@ class _FakeScanner:
 
     async def fetch_optional_derivatives(self, _symbol: str):
         return {}
+
+
+class _RecheckScanner(_FakeScanner):
+    def __init__(self, fresh_frame) -> None:
+        super().__init__()
+        self._fresh_frame = fresh_frame
+
+    async def fetch_symbol_frames(self, _symbols: list[str]):
+        return {"ONTUSDT": self._fresh_frame}
 
 
 class _CycleScanner:
@@ -207,6 +217,211 @@ def test_disabled_baseline_delivery_gate_has_no_signal_side_effects(
     assert outbox_count == 0
 
 
+def test_climax_initial_evaluation_records_every_enabled_branch(
+    tmp_path,
+    make_event_state,
+    make_features,
+    monkeypatch,
+) -> None:
+    async def _run() -> tuple[object | None, list[tuple[str, str, str]]]:
+        database = Database(f"sqlite:///{tmp_path / 'climax-observation-branches.db'}")
+        database.create_all()
+        repository = BotRepository(database)
+        state = repository.upsert_event_state(make_event_state())
+        features = make_features(asof=state.updated_at)
+        selected = ClimaxEvaluation(
+            subtype="VOLUME_CLIMAX_UNWIND",
+            score=70,
+            grade="B",
+            metadata={"event_high": state.event_high, "model_version": "climax-v1", "volume_climax_observed": False},
+            veto_reasons=[],
+            data_quality=[],
+        )
+        low_volume = ClimaxEvaluation(
+            subtype=None,
+            score=55,
+            grade="C",
+            metadata={"event_high": state.event_high, "model_version": "climax-v1"},
+            veto_reasons=["microstructure_break_missing"],
+            data_quality=[],
+        )
+        bundle = ClimaxEvaluationBundle(
+            selected=selected,
+            branch_evaluations={"VOLUME_CLIMAX_UNWIND": selected, "LOW_VOLUME_EXTENSION_FAILURE": low_volume},
+        )
+        monkeypatch.setattr("app.main.evaluate_climax_bundle", lambda *_args, **_kwargs: bundle)
+        bot = ShortSignalBot(
+            config=AppConfig(climax_short_enabled=True, volume_climax_lifecycle_shadow_enabled=False),
+            repository=repository,
+            scanner=_FakeScanner(),
+            notifier=_FakeNotifier(),
+        )
+
+        decision = await bot._evaluate_and_send_climax("ONTUSDT", object(), state, features=features)
+        with database.session() as session:
+            rows = [
+                (row.strategy, row.evaluation_phase, row.live_decision)
+                for row in session.scalars(select(StrategyObservationModel).order_by(StrategyObservationModel.strategy)).all()
+            ]
+        return decision, rows
+
+    decision, rows = asyncio.run(_run())
+
+    assert decision is not None
+    assert rows == [
+        ("LOW_VOLUME_EXTENSION_FAILURE", "INITIAL", "BLOCKED"),
+        ("VOLUME_CLIMAX_UNWIND", "INITIAL", "ACTIONABLE"),
+    ]
+
+
+def test_low_volume_recheck_records_all_branches_before_delivery_veto(
+    tmp_path,
+    make_event_state,
+    make_features,
+    make_frame,
+    monkeypatch,
+) -> None:
+    async def _run() -> tuple[list[tuple[str, str]], int]:
+        database = Database(f"sqlite:///{tmp_path / 'climax-observation-recheck.db'}")
+        database.create_all()
+        repository = BotRepository(database)
+        state = repository.upsert_event_state(make_event_state())
+        initial_features = make_features(asof=state.updated_at)
+        fresh_features = make_features(asof=state.updated_at + timedelta(minutes=1), price=111.0)
+        fresh_frame = make_frame([110.0, 111.0])
+        initial_low = ClimaxEvaluation(
+            subtype="LOW_VOLUME_EXTENSION_FAILURE",
+            score=75,
+            grade="B",
+            metadata={
+                "strategy_subtype": "LOW_VOLUME_EXTENSION_FAILURE",
+                "model_version": "climax-v1",
+                "event_high": state.event_high,
+                "entry_distance_below_high_pct": ((state.event_high - initial_features.price) / state.event_high * 100),
+                "volume_climax_observed": False,
+            },
+            veto_reasons=[],
+            data_quality=[],
+        )
+        blocked_low = ClimaxEvaluation(
+            subtype=None,
+            score=55,
+            grade="C",
+            metadata={"event_high": state.event_high, "model_version": "climax-v1"},
+            veto_reasons=["microstructure_break_missing"],
+            data_quality=[],
+        )
+        blocked_volume = ClimaxEvaluation(
+            subtype=None,
+            score=40,
+            grade="C",
+            metadata={"event_high": state.event_high, "model_version": "climax-v1"},
+            veto_reasons=["oi_missing_for_volume_climax"],
+            data_quality=[],
+        )
+        initial_bundle = ClimaxEvaluationBundle(
+            selected=initial_low,
+            branch_evaluations={
+                "VOLUME_CLIMAX_UNWIND": blocked_volume,
+                "LOW_VOLUME_EXTENSION_FAILURE": initial_low,
+            },
+        )
+        recheck_bundle = ClimaxEvaluationBundle(
+            selected=blocked_low,
+            branch_evaluations={
+                "VOLUME_CLIMAX_UNWIND": blocked_volume,
+                "LOW_VOLUME_EXTENSION_FAILURE": blocked_low,
+            },
+        )
+        bundles = iter([initial_bundle, recheck_bundle])
+        monkeypatch.setattr("app.main.evaluate_climax_bundle", lambda *_args, **_kwargs: next(bundles), raising=False)
+        bot = ShortSignalBot(
+            config=AppConfig(climax_short_enabled=True, volume_climax_lifecycle_shadow_enabled=False),
+            repository=repository,
+            scanner=_RecheckScanner(fresh_frame),
+            notifier=_FakeNotifier(),
+        )
+        bot._feature_builder.build = lambda *_args, **_kwargs: fresh_features
+
+        await bot._evaluate_and_send_climax("ONTUSDT", object(), state, features=initial_features)
+        with database.session() as session:
+            rows = [
+                (row.strategy, row.evaluation_phase)
+                for row in session.scalars(
+                    select(StrategyObservationModel).order_by(
+                        StrategyObservationModel.evaluation_phase,
+                        StrategyObservationModel.strategy,
+                    )
+                ).all()
+            ]
+            signal_count = len(session.scalars(select(SignalModel)).all())
+        return rows, signal_count
+
+    rows, signal_count = asyncio.run(_run())
+
+    assert rows == [
+        ("LOW_VOLUME_EXTENSION_FAILURE", "INITIAL"),
+        ("VOLUME_CLIMAX_UNWIND", "INITIAL"),
+        ("LOW_VOLUME_EXTENSION_FAILURE", "PRE_DELIVERY_RECHECK"),
+        ("VOLUME_CLIMAX_UNWIND", "PRE_DELIVERY_RECHECK"),
+    ]
+    assert signal_count == 0
+
+
+def test_failed_observation_write_alerts_without_changing_signal_delivery(
+    tmp_path,
+    make_event_state,
+    make_features,
+    monkeypatch,
+) -> None:
+    async def _run() -> tuple[int, list[str], int, int]:
+        database = Database(f"sqlite:///{tmp_path / 'climax-observation-failure.db'}")
+        database.create_all()
+        repository = BotRepository(database)
+        state = repository.upsert_event_state(make_event_state())
+        features = make_features(asof=state.updated_at)
+        selected = ClimaxEvaluation(
+            subtype="VOLUME_CLIMAX_UNWIND",
+            score=70,
+            grade="B",
+            metadata={"event_high": state.event_high, "model_version": "climax-v1", "volume_climax_observed": False},
+            veto_reasons=[],
+            data_quality=[],
+        )
+        bundle = ClimaxEvaluationBundle(
+            selected=selected,
+            branch_evaluations={"VOLUME_CLIMAX_UNWIND": selected},
+        )
+        monkeypatch.setattr("app.main.evaluate_climax_bundle", lambda *_args, **_kwargs: bundle, raising=False)
+        monkeypatch.setattr(
+            repository,
+            "record_strategy_observation",
+            lambda _observation: ObservationWriteResult(ObservationWriteStatus.FAILED),
+        )
+        notifier = _FakeNotifier()
+        bot = ShortSignalBot(
+            config=AppConfig(climax_short_enabled=True, volume_climax_lifecycle_shadow_enabled=False),
+            repository=repository,
+            scanner=_FakeScanner(),
+            notifier=notifier,
+        )
+
+        await bot._evaluate_and_send_climax("ONTUSDT", object(), state, features=features)
+        await bot._report_strategy_observation_failures([ObservationWriteResult(ObservationWriteStatus.FAILED)])
+        with database.session() as session:
+            signal_count = len(session.scalars(select(SignalModel)).all())
+            outbox_count = len(session.scalars(select(TelegramDeliveryOutboxModel)).all())
+        return signal_count, notifier.messages, outbox_count, bot._health.strategy_observation_write_failures
+
+    signal_count, messages, outbox_count, failure_count = asyncio.run(_run())
+
+    assert signal_count == 1
+    assert outbox_count == 1
+    assert messages[0] == "Strategy observation ledger write failed; scanner delivery continues."
+    assert len(messages) == 2
+    assert failure_count == 2
+
+
 @pytest.mark.parametrize(
     ("subtype", "gate_name", "delivery_enabled"),
     [
@@ -252,7 +467,13 @@ def test_disabled_climax_delivery_gates_have_no_signal_side_effects(
             veto_reasons=[],
             data_quality=[],
         )
-        monkeypatch.setattr("app.main.evaluate_climax", lambda *_args, **_kwargs: evaluation)
+        monkeypatch.setattr(
+            "app.main.evaluate_climax_bundle",
+            lambda *_args, **_kwargs: ClimaxEvaluationBundle(
+                selected=evaluation,
+                branch_evaluations={subtype: evaluation},
+            ),
+        )
 
         decision = await bot._evaluate_and_send_climax("ONTUSDT", object(), state, features=features)
         with database.session() as session:

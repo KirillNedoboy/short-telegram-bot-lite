@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
-from app.signals.climax import evaluate_climax, evaluate_climax_shadow
+from app.signals.climax import evaluate_climax, evaluate_climax_bundle, evaluate_climax_shadow
 
 
 def _config(**overrides):
@@ -98,6 +98,50 @@ def test_volume_climax_uses_canonical_five_minute_threshold(make_features, make_
         _config(volume_climax_min_ret_5m_pct=5.0, low_volume_extension_enabled=False),
     )
     assert "price_acceleration_below_threshold" in result.veto_reasons
+
+
+def test_bundle_keeps_every_enabled_branch_when_selected_result_is_rejected(
+    make_features,
+    make_event_state,
+    make_frame,
+):
+    features = make_features(
+        ret_5m=4.0,
+        ret_15m=15.0,
+        vol_zscore_30m=8.0,
+        oi_change_pct=None,
+        derivatives_status="MISSING",
+        rejection_from_high_pct=3.0,
+    )
+
+    bundle = evaluate_climax_bundle(
+        make_event_state(),
+        features,
+        make_frame([100 + index * 0.1 for index in range(30)]),
+        _config(),
+    )
+
+    assert set(bundle.branch_evaluations) == {
+        "VOLUME_CLIMAX_UNWIND",
+        "LOW_VOLUME_EXTENSION_FAILURE",
+    }
+    assert "oi_missing_for_volume_climax" in bundle.branch_evaluations["VOLUME_CLIMAX_UNWIND"].veto_reasons
+    assert bundle.selected.subtype is None
+
+
+def test_bundle_selected_evaluation_preserves_legacy_result(make_features, make_event_state, make_frame):
+    state = make_event_state()
+    features = make_features(ret_5m=10.0, ret_15m=15.0, vol_zscore_30m=8.0, oi_change_pct=-4.0)
+    frame = make_frame([100 + index * 0.1 for index in range(30)])
+    config = _config(low_volume_extension_enabled=False)
+
+    bundle = evaluate_climax_bundle(state, features, frame, config)
+    legacy = evaluate_climax(state, features, frame, config)
+
+    assert bundle.selected.subtype == legacy.subtype
+    assert bundle.selected.score == legacy.score
+    assert bundle.selected.grade == legacy.grade
+    assert bundle.selected.veto_reasons == legacy.veto_reasons
 
 
 def test_low_score_volume_observation_is_retained(make_features, make_event_state, make_frame):
