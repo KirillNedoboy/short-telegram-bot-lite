@@ -1,9 +1,13 @@
 from datetime import datetime, timedelta, timezone
+from threading import Barrier
 from types import SimpleNamespace
+
+from sqlalchemy import select
 
 from app.domain import EventState
 from app.main import ShortSignalBot, _decision_delta
 from app.storage.db import Database
+from app.storage.models import ClimaxEntryAttemptEventModel, ClimaxEntryAttemptModel
 from app.storage.repository import BotRepository
 
 
@@ -418,6 +422,95 @@ def test_expiry_transition_is_serialized_for_concurrent_calls(tmp_path):
     assert sum(results) == 1
     with database.engine.connect() as connection:
         assert connection.exec_driver_sql("select count(*) from climax_entry_attempt_events where attempt_id='root-expiry:r1:a1' and event_type='attempt_closed'").scalar_one() == 1
+
+
+def test_mixed_expiry_and_root_replacement_has_one_terminal_winner(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    database = Database(f"sqlite:///{tmp_path / 'mixed-terminal-race.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    now = datetime.now(timezone.utc)
+    repository.upsert_shadow_entry_attempt(
+        attempt_id="root-mixed:r1:a1",
+        root_event_id="root-mixed",
+        observed_at=now - timedelta(minutes=3),
+        local_retest_high=1.0,
+        breakdown_level=0.99,
+        attempt_state="CONFIRMATION_PENDING",
+        confirmation_expires_at=now - timedelta(seconds=1),
+    )
+
+    barrier = Barrier(2)
+
+    def expire():
+        barrier.wait(timeout=10)
+        return repository.expire_shadow_attempt_if_due(
+            attempt_id="root-mixed:r1:a1",
+            root_event_id="root-mixed",
+            event_revision=1,
+            evaluation_id=101,
+            observed_at=now,
+            market_asof=now,
+            runtime_instance_id="runtime-mixed",
+            model_version="climax-v1",
+        )
+
+    def replace_root():
+        barrier.wait(timeout=10)
+        return repository.close_open_shadow_attempts_for_root(
+            root_event_id="root-mixed",
+            new_state="ROOT_REPLACED",
+            reason="higher_high_observed",
+            observed_at=now,
+            runtime_instance_id="runtime-mixed",
+            model_version="climax-v1",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = list(executor.map(lambda fn: fn(), (expire, replace_root)))
+
+    assert first in (True, False)
+    assert second in (0, 1)
+    assert int(first is True) + int(second == 1) == 1
+    with database.session() as session:
+        attempt = session.get(ClimaxEntryAttemptModel, "root-mixed:r1:a1")
+        events = session.scalars(
+            select(ClimaxEntryAttemptEventModel).where(
+                ClimaxEntryAttemptEventModel.attempt_id == "root-mixed:r1:a1",
+                ClimaxEntryAttemptEventModel.event_type == "attempt_closed",
+            )
+        ).all()
+    assert attempt.attempt_closed_at is not None
+    assert attempt.attempt_state in {"EXPIRED", "ROOT_REPLACED"}
+    assert attempt.attempt_close_reason in {"confirmation_ttl_expired", "higher_high_observed"}
+    assert len(events) == 1
+    assert events[0].new_state == attempt.attempt_state
+    assert events[0].reason == attempt.attempt_close_reason
+
+
+def test_reconciliation_failure_is_reported_distinctly():
+    from contextlib import contextmanager
+
+    class BrokenDatabase:
+        is_sqlite = True
+
+        @contextmanager
+        def session(self):
+            raise RuntimeError("synthetic reconciliation failure")
+            yield
+
+    repository = BotRepository(BrokenDatabase())
+    result = repository.reconcile_shadow_lifecycle(
+        observed_at=datetime.now(timezone.utc),
+        runtime_instance_id="runtime-broken",
+        model_version="climax-v1",
+    )
+
+    assert result["reconciliation_failed"] == 1
+    assert result["expired_reconciled"] == 0
+    assert result["orphan_attempts"] == 0
+    assert result["duplicate_terminal_event_groups"] == 0
 
 
 def test_startup_reconciliation_closes_expired_and_marks_orphans(tmp_path):
