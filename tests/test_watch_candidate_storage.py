@@ -76,6 +76,29 @@ def test_watch_candidate_missing_dist_to_vwap_pct_is_stored_without_integrity_er
         assert stored.actionable is False
 
 
+def test_delivery_status_can_be_updated_after_durable_insert(tmp_path, make_event_state, make_signal_decision) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'delivery-status.db'}")
+    database.create_all()
+    repository = BotRepository(database)
+    state = repository.upsert_event_state(make_event_state())
+    signal = repository.save_signal(make_signal_decision(), state, telegram_sent=False)
+    watch_decision = make_signal_decision(
+        signal_type=SignalType.WATCH,
+        actionable=False,
+        decision_type="WATCH",
+        blockers=["thin_orderbook"],
+    )
+    watch = repository.save_watch_candidate(watch_decision, state, telegram_sent=False)
+
+    repository.update_signal_telegram_status(signal.id, True)
+    repository.update_watch_telegram_status(watch.id, True)
+
+    with database.session() as session:
+        assert session.get(SignalModel, signal.id).telegram_sent is True
+        assert session.get(WatchCandidateModel, watch.id).telegram_sent is True
+
+
+
 def test_actionable_signal_still_persists_dist_to_vwap_pct(tmp_path, make_event_state, make_signal_decision) -> None:
     database = Database(f"sqlite:///{tmp_path / 'signal.db'}")
     database.create_all()

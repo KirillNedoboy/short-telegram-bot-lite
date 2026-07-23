@@ -318,6 +318,22 @@ class BotRepository:
             session.refresh(model)
             return _signal_from_model(model)
 
+    def update_signal_telegram_status(self, signal_id: int, telegram_sent: bool) -> None:
+        """Persist delivery result after a durable signal row already exists."""
+        with self._db.session() as session:
+            model = session.get(SignalModel, signal_id)
+            if model is None:
+                raise LookupError(f"signal not found: {signal_id}")
+            model.telegram_sent = telegram_sent
+
+    def update_watch_telegram_status(self, watch_id: int, telegram_sent: bool) -> None:
+        """Persist WATCH delivery result after its durable row already exists."""
+        with self._db.session() as session:
+            model = session.get(WatchCandidateModel, watch_id)
+            if model is None:
+                raise LookupError(f"watch candidate not found: {watch_id}")
+            model.telegram_sent = telegram_sent
+
     def has_signal_for_event(self, symbol: str, event_id: str, strategy_subtype: str, model_version: str) -> bool:
         """Idempotent dedupe check for the main and fast-monitor paths."""
         with self._db.session() as session:
@@ -812,6 +828,9 @@ class BotRepository:
         """Apply an idempotent shadow lifecycle transition; never creates delivery state."""
         try:
             with self._db.session() as session:
+                if getattr(self._db, "is_sqlite", False):
+                    # Serialize read-check-update-event for terminal transitions.
+                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 model = session.get(ClimaxEntryAttemptModel, attempt_id)
                 if model is None or model.attempt_closed_at is not None:
                     return False
@@ -875,6 +894,8 @@ class BotRepository:
     ) -> int:
         """Close all currently open attempts for a replaced root without touching signals."""
         with self._db.session() as session:
+            if getattr(self._db, "is_sqlite", False):
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             models = session.scalars(
                 select(ClimaxEntryAttemptModel).where(
                     ClimaxEntryAttemptModel.root_event_id == root_event_id,
@@ -953,6 +974,8 @@ class BotRepository:
     ) -> bool:
         """Close an open attempt once its immutable confirmation TTL has elapsed."""
         with self._db.session() as session:
+            if getattr(self._db, "is_sqlite", False):
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             model = session.get(ClimaxEntryAttemptModel, attempt_id)
             if not model or model.attempt_closed_at is not None or not model.confirmation_expires_at:
                 return False
@@ -1035,6 +1058,114 @@ class BotRepository:
                 details={},
                 idempotency_key=f"{attempt_id}:restart:{runtime_instance_id or 'unknown'}",
             )
+
+    def reconcile_shadow_lifecycle(
+        self,
+        *,
+        observed_at: datetime,
+        runtime_instance_id: str | None,
+        model_version: str,
+    ) -> dict[str, int]:
+        """Reconcile expired/orphan shadow attempts without fabricating live state."""
+        reconciled_expired = 0
+        orphan_attempts = 0
+        duplicate_terminal_events = 0
+        try:
+            with self._db.session() as session:
+                if getattr(self._db, "is_sqlite", False):
+                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                root_ids = set(session.scalars(select(ClimaxRootEventModel.root_event_id)).all())
+                attempts = session.scalars(select(ClimaxEntryAttemptModel)).all()
+                for model in attempts:
+                    if model.root_event_id not in root_ids:
+                        orphan_detected = self._append_attempt_event(
+                            session,
+                            attempt_id=model.attempt_id,
+                            root_event_id=model.root_event_id,
+                            event_revision=None,
+                            evaluation_id=None,
+                            event_type="orphan_attempt_detected",
+                            previous_state=model.attempt_state,
+                            new_state=model.attempt_state,
+                            reason="root_event_missing",
+                            observed_at=observed_at,
+                            market_asof=None,
+                            runtime_instance_id=runtime_instance_id,
+                            model_version=model_version,
+                            details={},
+                            idempotency_key=f"{model.attempt_id}:orphan-root",
+                        )
+                        orphan_attempts += int(orphan_detected)
+                    if (
+                        model.attempt_closed_at is None
+                        and model.confirmation_expires_at is not None
+                        and (model.confirmation_expires_at.replace(tzinfo=timezone.utc) if model.confirmation_expires_at.tzinfo is None else model.confirmation_expires_at) <= observed_at
+                    ):
+                        previous = model.attempt_state
+                        model.attempt_state = "EXPIRED"
+                        model.attempt_closed_at = observed_at
+                        model.attempt_close_reason = model.attempt_close_reason or "startup_reconciliation_ttl_expired"
+                        model.last_observed_at = observed_at
+                        self._append_attempt_event(
+                            session,
+                            attempt_id=model.attempt_id,
+                            root_event_id=model.root_event_id,
+                            event_revision=None,
+                            evaluation_id=None,
+                            event_type="attempt_state_changed",
+                            previous_state=previous,
+                            new_state="EXPIRED",
+                            reason="startup_reconciliation_ttl_expired",
+                            observed_at=observed_at,
+                            market_asof=None,
+                            runtime_instance_id=runtime_instance_id,
+                            model_version=model_version,
+                            details={},
+                            idempotency_key=f"{model.attempt_id}:reconcile-state:EXPIRED",
+                        )
+                        self._append_attempt_event(
+                            session,
+                            attempt_id=model.attempt_id,
+                            root_event_id=model.root_event_id,
+                            event_revision=None,
+                            evaluation_id=None,
+                            event_type="attempt_closed",
+                            previous_state=previous,
+                            new_state="EXPIRED",
+                            reason="startup_reconciliation_ttl_expired",
+                            observed_at=observed_at,
+                            market_asof=None,
+                            runtime_instance_id=runtime_instance_id,
+                            model_version=model_version,
+                            details={},
+                            idempotency_key=f"{model.attempt_id}:reconcile-closed:EXPIRED",
+                        )
+                        reconciled_expired += 1
+                duplicate_rows = session.execute(
+                    select(
+                        ClimaxEntryAttemptEventModel.attempt_id,
+                        ClimaxEntryAttemptEventModel.event_type,
+                        func.count(ClimaxEntryAttemptEventModel.id),
+                    )
+                    .where(ClimaxEntryAttemptEventModel.event_type == "attempt_closed")
+                    .group_by(ClimaxEntryAttemptEventModel.attempt_id, ClimaxEntryAttemptEventModel.event_type)
+                    .having(func.count(ClimaxEntryAttemptEventModel.id) > 1)
+                ).all()
+                duplicate_terminal_events = len(duplicate_rows)
+            return {
+                "expired_reconciled": reconciled_expired,
+                "orphan_attempts": orphan_attempts,
+                "duplicate_terminal_event_groups": duplicate_terminal_events,
+                "reconciliation_failed": 0,
+            }
+        except Exception:
+            logger.exception("shadow lifecycle reconciliation failed")
+            return {
+                "expired_reconciled": 0,
+                "orphan_attempts": 0,
+                "duplicate_terminal_event_groups": 0,
+                "reconciliation_failed": 1,
+            }
 
     def record_attempt_correlation_missing(
         self,

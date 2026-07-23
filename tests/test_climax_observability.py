@@ -345,6 +345,128 @@ def test_attempt_limit_is_serialized_for_concurrent_sqlite_admission(tmp_path):
         assert connection.exec_driver_sql("select count(*) from climax_entry_attempts where root_event_id='root-concurrent'").scalar_one() == 1
 
 
+def test_terminal_transition_is_serialized_for_concurrent_calls(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    database = Database(f"sqlite:///{tmp_path / 'transition-concurrency.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    now = datetime.now(timezone.utc)
+    repository.upsert_shadow_entry_attempt(
+        attempt_id="root-transition:r1:a1",
+        root_event_id="root-transition",
+        observed_at=now,
+        local_retest_high=1.0,
+        breakdown_level=0.99,
+        attempt_state="BREAKDOWN_PENDING",
+    )
+
+    def close_attempt(evaluation_id):
+        return repository.transition_shadow_entry_attempt(
+            attempt_id="root-transition:r1:a1",
+            root_event_id="root-transition",
+            event_revision=1,
+            evaluation_id=evaluation_id,
+            new_state="EXPIRED",
+            reason="concurrent_expiry",
+            observed_at=now,
+            market_asof=now,
+            runtime_instance_id="runtime-transition",
+            model_version="climax-v1",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(close_attempt, range(8)))
+
+    assert sum(results) == 1
+    with database.engine.connect() as connection:
+        assert connection.exec_driver_sql("select count(*) from climax_entry_attempt_events where attempt_id='root-transition:r1:a1' and event_type='attempt_closed'").scalar_one() == 1
+
+
+def test_expiry_transition_is_serialized_for_concurrent_calls(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    database = Database(f"sqlite:///{tmp_path / 'expiry-concurrency.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    now = datetime.now(timezone.utc)
+    repository.upsert_shadow_entry_attempt(
+        attempt_id="root-expiry:r1:a1",
+        root_event_id="root-expiry",
+        observed_at=now - timedelta(minutes=3),
+        local_retest_high=1.0,
+        breakdown_level=0.99,
+        attempt_state="CONFIRMATION_PENDING",
+        confirmation_expires_at=now - timedelta(seconds=1),
+    )
+
+    def expire(evaluation_id):
+        return repository.expire_shadow_attempt_if_due(
+            attempt_id="root-expiry:r1:a1",
+            root_event_id="root-expiry",
+            event_revision=1,
+            evaluation_id=evaluation_id,
+            observed_at=now,
+            market_asof=now,
+            runtime_instance_id="runtime-expiry",
+            model_version="climax-v1",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(expire, range(8)))
+
+    assert sum(results) == 1
+    with database.engine.connect() as connection:
+        assert connection.exec_driver_sql("select count(*) from climax_entry_attempt_events where attempt_id='root-expiry:r1:a1' and event_type='attempt_closed'").scalar_one() == 1
+
+
+def test_startup_reconciliation_closes_expired_and_marks_orphans(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'reconciliation.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    now = datetime.now(timezone.utc)
+    repository.upsert_shadow_root_event(
+        root_event_id="root-reconcile",
+        symbol="RECONUSDT",
+        event_started_at=now - timedelta(minutes=10),
+        event_base_price=1.0,
+        peak_high=1.2,
+        peak_high_time=now - timedelta(minutes=8),
+        initial_extension_pct=20.0,
+        initial_extension_source="test",
+        observed_at=now - timedelta(minutes=8),
+    )
+    repository.upsert_shadow_entry_attempt(
+        attempt_id="root-reconcile:r1:a1",
+        root_event_id="root-reconcile",
+        observed_at=now - timedelta(minutes=5),
+        local_retest_high=1.2,
+        breakdown_level=1.1,
+        attempt_state="RETEST_IN_PROGRESS",
+        confirmation_expires_at=now - timedelta(minutes=1),
+    )
+    repository.upsert_shadow_entry_attempt(
+        attempt_id="orphan:r1:a1",
+        root_event_id="orphan",
+        observed_at=now - timedelta(minutes=5),
+        local_retest_high=1.2,
+        breakdown_level=1.1,
+        attempt_state="RETEST_IN_PROGRESS",
+    )
+
+    result = repository.reconcile_shadow_lifecycle(
+        observed_at=now,
+        runtime_instance_id="runtime-reconcile",
+        model_version="climax-v1-shadow",
+    )
+
+    assert result["expired_reconciled"] == 1
+    assert result["orphan_attempts"] == 1
+    with database.engine.connect() as connection:
+        assert connection.exec_driver_sql("select attempt_state, attempt_closed_at, attempt_close_reason from climax_entry_attempts where attempt_id='root-reconcile:r1:a1'").one()[0] == "EXPIRED"
+        assert connection.exec_driver_sql("select count(*) from climax_entry_attempt_events where event_type='orphan_attempt_detected'").scalar_one() == 1
+
+
 def test_evaluation_attempt_correlation_and_missing_event_telemetry(tmp_path):
     database = Database(f"sqlite:///{tmp_path / 'correlation.sqlite'}")
     database.create_all()

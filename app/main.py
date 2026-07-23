@@ -165,7 +165,21 @@ class ShortSignalBot:
 
     async def startup(self) -> None:
         await self._notifier.start()
-        await self._ensure_storage_healthy("startup")
+        storage_healthy = await self._ensure_storage_healthy("startup")
+        if not storage_healthy:
+            self._logger.error("Startup aborted: storage health check failed")
+            return
+        reconcile = getattr(self._repository, "reconcile_shadow_lifecycle", None)
+        if reconcile is not None:
+            reconciliation = reconcile(
+                observed_at=datetime.now(timezone.utc),
+                runtime_instance_id=self._runtime_instance_id,
+                model_version="climax-v1-shadow",
+            )
+            if reconciliation.get("reconciliation_failed"):
+                self._logger.error("Shadow lifecycle reconciliation failed; runtime evidence is degraded")
+            elif any(reconciliation.values()):
+                self._logger.warning("Shadow lifecycle reconciliation | %s", reconciliation)
         if self._config.climax_short_enabled and self._config.climax_fast_monitor_enabled:
             self._fast_monitor_running = True
             self._fast_monitor_task = asyncio.create_task(self._run_fast_monitor(), name="climax-fast-monitor")
@@ -896,8 +910,9 @@ class ShortSignalBot:
                     if not fresh_eval.actionable or fresh_eval.subtype != "LOW_VOLUME_EXTENSION_FAILURE":
                         self._logger.info("Climax delivery veto: fresh_admission_failed symbol=%s reasons=%s", symbol, fresh_eval.veto_reasons)
                         return None
+        record = self._repository.save_signal(decision, state, telegram_sent=False)
         telegram_sent = await self._notifier.send_signal(format_signal_message(decision, self._config.timezone))
-        record = self._repository.save_signal(decision, state, telegram_sent)
+        self._repository.update_signal_telegram_status(record.id, telegram_sent)
         state = self._pullback_tracker.mark_signal_sent(state, signal_id=record.id, when=features.asof)
         self._state_store.save(state)
         self._remove_climax_candidate(symbol, state.event_id, reason="signal_created")
@@ -1000,17 +1015,19 @@ class ShortSignalBot:
             watch_type = _watch_delivery_type(decision)
             if _watch_already_emitted(state, watch_type=watch_type):
                 return None, state
+            candidate = self._repository.save_watch_candidate(decision, state, telegram_sent=False)
             telegram_sent = False
             if self._config.send_watch_to_telegram and self._watch_sent_in_cycle < self._config.watch_max_per_cycle:
                 telegram_sent = await self._notifier.send_signal(format_signal_message(decision, self._config.timezone))
                 if telegram_sent:
                     self._watch_sent_in_cycle += 1
+            self._repository.update_watch_telegram_status(candidate.id, telegram_sent)
             _mark_watch_emitted(state, watch_type=watch_type)
-            self._repository.save_watch_candidate(decision, state, telegram_sent)
             return decision, state
 
+        record = self._repository.save_signal(decision, state, telegram_sent=False)
         telegram_sent = await self._notifier.send_signal(format_signal_message(decision, self._config.timezone))
-        record = self._repository.save_signal(decision, state, telegram_sent)
+        self._repository.update_signal_telegram_status(record.id, telegram_sent)
         state = self._pullback_tracker.mark_signal_sent(state, signal_id=record.id, when=now)
         return decision, state
 
