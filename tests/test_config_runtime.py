@@ -104,3 +104,45 @@ def test_request_timeout_env_override_is_loaded(tmp_path) -> None:
     config = load_config(config_path=config_path, env_path=env_path)
 
     assert config.request_timeout_sec == 35
+
+
+def test_legacy_volume_climax_five_minute_threshold_is_migrated_with_warning(caplog) -> None:
+    with caplog.at_level("WARNING"):
+        config = AppConfig.model_validate({"volume_climax_min_price_change_5m_pct": 3.0})
+
+    assert config.volume_climax_min_ret_5m_pct == 3.0
+    assert "deprecated" in caplog.text.lower()
+
+
+def test_historical_conflicting_volume_climax_thresholds_preserve_effective_value(caplog) -> None:
+    with caplog.at_level("WARNING"):
+        config = AppConfig.model_validate(
+            {
+                "volume_climax_min_ret_5m_pct": 8.0,
+                "volume_climax_min_price_change_5m_pct": 3.0,
+            }
+        )
+
+    assert config.volume_climax_min_ret_5m_pct == 3.0
+    assert "deprecated" in caplog.text.lower()
+
+
+def test_equivalent_volume_climax_thresholds_do_not_conflict() -> None:
+    config = AppConfig.model_validate(
+        {
+            "volume_climax_min_ret_5m_pct": "3.0",
+            "volume_climax_min_price_change_5m_pct": 3.0,
+        }
+    )
+
+    assert config.volume_climax_min_ret_5m_pct == 3.0
+
+
+def test_ambiguous_volume_climax_threshold_conflict_fails_validation() -> None:
+    with pytest.raises(ValueError, match="conflicting"):
+        AppConfig.model_validate(
+            {
+                "volume_climax_min_ret_5m_pct": 4.0,
+                "volume_climax_min_price_change_5m_pct": 3.0,
+            }
+        )

@@ -292,7 +292,7 @@ def _volume_climax(base: dict[str, Any], state: EventState, features: SymbolFeat
         vetoes.append("price_oi_accelerating_together")
     if volume_ratio < config.volume_climax_min_volume_ratio and features.vol_zscore_30m < config.volume_climax_min_volume_zscore:
         vetoes.append("volume_climax_not_extreme")
-    if features.ret_5m < config.volume_climax_min_price_change_5m_pct:
+    if features.ret_5m < config.volume_climax_min_ret_5m_pct:
         vetoes.append("price_acceleration_below_threshold")
     if features.ret_15m < config.volume_climax_min_ret_15m_pct:
         vetoes.append("pump_below_threshold")
@@ -300,7 +300,7 @@ def _volume_climax(base: dict[str, Any], state: EventState, features: SymbolFeat
         vetoes.append("rejection_missing")
     if (data["entry_distance_below_high_pct"] or 999) > config.volume_climax_max_entry_distance_below_high_pct:
         vetoes.append("entry_too_far_from_high")
-    score = _score([features.ret_5m >= config.volume_climax_min_price_change_5m_pct, volume_ratio >= config.volume_climax_min_volume_ratio or features.vol_zscore_30m >= config.volume_climax_min_volume_zscore, (features.oi_change_pct or 0) < config.volume_climax_max_oi_change_5m_pct, data["rejection_pct"] >= config.volume_climax_min_rejection_pct, features.latest_failed_retest])
+    score = _score([features.ret_5m >= config.volume_climax_min_ret_5m_pct, volume_ratio >= config.volume_climax_min_volume_ratio or features.vol_zscore_30m >= config.volume_climax_min_volume_zscore, (features.oi_change_pct or 0) < config.volume_climax_max_oi_change_5m_pct, data["rejection_pct"] >= config.volume_climax_min_rejection_pct, features.latest_failed_retest])
     grade = _grade(score)
     if not features.liquidity_available:
         vetoes.append("liquidity_not_confirmed")

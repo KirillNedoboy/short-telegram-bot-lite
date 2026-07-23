@@ -51,6 +51,9 @@ enable_watch_candidates: true
 send_watch_to_telegram: false
 watch_min_score: 45
 watch_max_per_cycle: 5
+baseline_live_delivery_enabled: true
+volume_climax_live_delivery_enabled: true
+low_volume_live_delivery_enabled: true
 enable_squeeze_guard: true
 squeeze_guard_mode: warn_only
 retest_not_failed_penalty: 4
@@ -72,7 +75,7 @@ volume_climax_unwind_enabled: true
 volume_climax_min_ret_15m_pct: 12.0
 volume_climax_min_volume_ratio: 3.0
 volume_climax_min_volume_zscore: 2.5
-volume_climax_min_price_change_5m_pct: 3.0
+volume_climax_min_ret_5m_pct: 3.0
 volume_climax_max_oi_change_5m_pct: -1.0
 volume_climax_min_rejection_pct: 2.0
 volume_climax_max_entry_distance_below_high_pct: 20.0

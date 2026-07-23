@@ -14,6 +14,14 @@ Lightweight live Telegram signal bot for Bybit USDT perpetual contracts.
 - sends Telegram alerts for actionable signals
 - stores signals, WATCH candidates, event state, and basic outcomes in SQLite
 
+## Live Delivery Contract
+
+Live V1 strategies are `BASELINE_PULLBACK`, `VOLUME_CLIMAX_UNWIND`, and `LOW_VOLUME_EXTENSION_FAILURE`. Their separate delivery gates default to `true`.
+
+`VOLUME_CLIMAX_LIFECYCLE_SHADOW_V2` is research-only telemetry; its lifecycle states do not replace live V1 admission. `EARLY_PUMP_WATCH` follows `send_watch_to_telegram`, which defaults to `false`. The bot has no order execution.
+
+Telegram delivery is persisted through `telegram_delivery_outbox` with at-least-once semantics. A network acknowledgement can be ambiguous, so duplicate delivery remains possible.
+
 ## Project Layout
 
 ```text

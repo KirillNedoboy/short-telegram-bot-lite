@@ -11,11 +11,10 @@ def _config(**overrides):
         volume_climax_unwind_enabled=True,
         low_volume_extension_enabled=True,
         climax_min_signal_score=70,
-        volume_climax_min_ret_5m_pct=8.0,
+        volume_climax_min_ret_5m_pct=3.0,
         volume_climax_min_ret_15m_pct=12.0,
         volume_climax_min_volume_ratio=3.0,
         volume_climax_min_volume_zscore=2.5,
-        volume_climax_min_price_change_5m_pct=3.0,
         volume_climax_max_oi_change_5m_pct=-1.0,
         volume_climax_min_rejection_pct=2.0,
         volume_climax_max_entry_distance_below_high_pct=20.0,
@@ -96,7 +95,7 @@ def test_volume_climax_uses_canonical_five_minute_threshold(make_features, make_
         make_event_state(),
         features,
         make_frame([100 + i * 0.1 for i in range(30)]),
-        _config(volume_climax_min_price_change_5m_pct=5.0, low_volume_extension_enabled=False),
+        _config(volume_climax_min_ret_5m_pct=5.0, low_volume_extension_enabled=False),
     )
     assert "price_acceleration_below_threshold" in result.veto_reasons
 

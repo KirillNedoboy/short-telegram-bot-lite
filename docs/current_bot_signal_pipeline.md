@@ -197,6 +197,8 @@ This is the effective signal path from live market data to Telegram and later to
    - Files: `app/storage/repository.py`, `app/storage/models.py`
    - Functions: `BotRepository.save_signal()`, `BotRepository.save_watch_candidate()`
    - The source row is created with `telegram_sent=False` and, for enabled delivery, an immutable `telegram_delivery_outbox` payload in the same transaction.
+   - Live V1 delivery is allowed separately for `BASELINE_PULLBACK`, `VOLUME_CLIMAX_UNWIND`, and `LOW_VOLUME_EXTENSION_FAILURE`; all three shipped gates are `true`.
+   - `VOLUME_CLIMAX_LIFECYCLE_SHADOW_V2` remains research telemetry and does not control V1 admission. WATCH delivery remains disabled by `send_watch_to_telegram=false`.
 
 20. **Claim, send, and reconcile Telegram delivery**
    - File: `app/main.py`
@@ -205,6 +207,7 @@ This is the effective signal path from live market data to Telegram and later to
    - Success atomically marks outbox `SENT` and source `telegram_sent=True`.
    - `False`/exception persists `RETRY`; five attempts become `DEAD`.
    - The outbox is at-least-once and does not auto-enqueue historical unsent rows.
+   - It is not exactly-once: an ambiguous Telegram acknowledgement can result in a duplicate on retry.
 
 21. **Persist signal evidence**
    - Stored data includes:
@@ -295,7 +298,6 @@ These are not interchangeable, and they are decided in different layers.
 
 ### Missing pipeline artifacts
 
-- no persisted Telegram payload table
 - no persisted raw candle store
 - no persisted score-only audit table
 - no persisted per-signal cooldown/dedup table

@@ -1,4 +1,10 @@
-from app.market.bybit_client import BybitClient
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from app.market.bybit_client import BybitClient, BybitResponseError
 
 
 class _FakeHTTP:
@@ -19,3 +25,114 @@ def test_bybit_client_passes_timeout(monkeypatch) -> None:
 
     assert captured["timeout"] == 27
     assert captured["testnet"] is False
+
+
+class _StaticScheduler:
+    async def schedule(self, operation, **kwargs):
+        return operation(**kwargs)
+
+
+class _ResponseHTTP:
+    def __init__(self, responses: dict[str, list[object]]) -> None:
+        self._responses = responses
+
+    def _next(self, operation: str, **_kwargs):
+        return self._responses[operation].pop(0)
+
+    def get_instruments_info(self, **kwargs):
+        return self._next("fetch_instruments", **kwargs)
+
+    def get_tickers(self, **kwargs):
+        return self._next("fetch_tickers", **kwargs)
+
+    def get_kline(self, **kwargs):
+        return self._next("fetch_klines", **kwargs)
+
+    def get_open_interest(self, **kwargs):
+        return self._next("fetch_open_interest", **kwargs)
+
+    def get_funding_rate_history(self, **kwargs):
+        return self._next("fetch_funding", **kwargs)
+
+    def get_orderbook(self, **kwargs):
+        return self._next("fetch_orderbook", **kwargs)
+
+
+def _client(responses: dict[str, list[object]]) -> BybitClient:
+    client = BybitClient.__new__(BybitClient)
+    client._scheduler = _StaticScheduler()
+    client._client = _ResponseHTTP(responses)
+    return client
+
+
+def test_fetch_tickers_accepts_success_envelope() -> None:
+    client = _client({"fetch_tickers": [{"retCode": 0, "result": {"list": [{"symbol": "TESTUSDT"}]}}]})
+
+    assert asyncio.run(client.fetch_tickers()) == [{"symbol": "TESTUSDT"}]
+
+
+def test_fetch_tickers_accepts_empty_success_list() -> None:
+    client = _client({"fetch_tickers": [{"retCode": 0, "result": {"list": []}}]})
+
+    assert asyncio.run(client.fetch_tickers()) == []
+
+
+def test_nonzero_bybit_response_code_raises_typed_error() -> None:
+    client = _client({"fetch_tickers": [{"retCode": 10001, "retMsg": "bad request", "result": {"list": []}}]})
+
+    with pytest.raises(BybitResponseError, match="fetch_tickers") as exc_info:
+        asyncio.run(client.fetch_tickers())
+
+    assert exc_info.value.ret_code == 10001
+    assert exc_info.value.ret_msg == "bad request"
+
+
+def test_missing_result_raises_typed_error() -> None:
+    client = _client({"fetch_klines": [{"retCode": 0}]})
+
+    with pytest.raises(BybitResponseError, match="fetch_klines"):
+        asyncio.run(client.fetch_klines("TESTUSDT", "1"))
+
+
+def test_malformed_list_result_raises_typed_error() -> None:
+    client = _client({"fetch_funding": [{"retCode": 0, "result": {"list": {}}}]})
+
+    with pytest.raises(BybitResponseError, match="fetch_funding"):
+        asyncio.run(client.fetch_funding("TESTUSDT"))
+
+
+def test_instrument_pagination_validates_second_page() -> None:
+    client = _client(
+        {
+            "fetch_instruments": [
+                {"retCode": 0, "result": {"list": [{"symbol": "FIRST"}], "nextPageCursor": "next"}},
+                {"retCode": 10006, "retMsg": "rate limited", "result": {"list": []}},
+            ]
+        }
+    )
+
+    with pytest.raises(BybitResponseError, match="fetch_instruments"):
+        asyncio.run(client.fetch_instruments())
+
+
+def test_orderbook_requires_mapping_result() -> None:
+    client = _client({"fetch_orderbook": [{"retCode": 0, "result": []}]})
+
+    with pytest.raises(BybitResponseError, match="fetch_orderbook"):
+        asyncio.run(client.fetch_orderbook("TESTUSDT"))
+
+
+def test_bybit_response_error_does_not_include_full_payload() -> None:
+    secret_marker = "sensitive-payload-marker"
+    client = _client(
+        {
+            "fetch_open_interest": [
+                {"retCode": 10001, "retMsg": "bad request", "result": {"list": [], "token": secret_marker}}
+            ]
+        }
+    )
+
+    with pytest.raises(BybitResponseError) as exc_info:
+        asyncio.run(client.fetch_open_interest("TESTUSDT"))
+
+    assert secret_marker not in str(exc_info.value)

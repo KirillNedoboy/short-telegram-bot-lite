@@ -29,6 +29,7 @@ from app.notifications.telegram import TelegramNotifier
 from app.notifications.throttling import ErrorThrottler
 from app.outcomes.tracker import OutcomeTracker
 from app.signals.climax import ClimaxEvaluation, advance_volume_climax_lifecycle, evaluate_climax, evaluate_climax_shadow, volume_climax_attempt_id
+from app.signals.delivery_policy import live_delivery_enabled
 from app.signals.engine import SignalEngine
 from app.signals.formatter import format_signal_message
 from app.storage.db import Database
@@ -972,6 +973,13 @@ class ShortSignalBot:
                     if not fresh_eval.actionable or fresh_eval.subtype != "LOW_VOLUME_EXTENSION_FAILURE":
                         self._logger.info("Climax delivery veto: fresh_admission_failed symbol=%s reasons=%s", symbol, fresh_eval.veto_reasons)
                         return None
+        if not live_delivery_enabled(decision, self._config):
+            self._logger.warning(
+                "live_delivery_disabled strategy_type=%s strategy_subtype=%s",
+                decision.strategy_type,
+                decision.strategy_subtype,
+            )
+            return None
         payload = format_signal_message(decision, self._config.timezone)
         record = self._repository.save_signal(decision, state, telegram_sent=False, delivery_payload=payload)
         telegram_sent = await self._send_new_delivery(entity_type="SIGNAL", entity_id=record.id)
@@ -1091,6 +1099,13 @@ class ShortSignalBot:
             _mark_watch_emitted(state, watch_type=watch_type)
             return decision, state
 
+        if not live_delivery_enabled(decision, self._config):
+            self._logger.warning(
+                "live_delivery_disabled strategy_type=%s strategy_subtype=%s",
+                decision.strategy_type,
+                decision.strategy_subtype,
+            )
+            return None, state
         payload = format_signal_message(decision, self._config.timezone)
         record = self._repository.save_signal(decision, state, telegram_sent=False, delivery_payload=payload)
         telegram_sent = await self._send_new_delivery(entity_type="SIGNAL", entity_id=record.id)

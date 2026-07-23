@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import yaml
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+
+logger = logging.getLogger(__name__)
 
 
 class AppConfig(BaseModel):
@@ -72,6 +76,9 @@ class AppConfig(BaseModel):
     min_public_signal_grade: str = "B"
     send_grade_c_to_telegram: bool = False
     grade_c_mode: str = "watch_only"
+    baseline_live_delivery_enabled: bool = True
+    volume_climax_live_delivery_enabled: bool = True
+    low_volume_live_delivery_enabled: bool = True
 
     climax_short_enabled: bool = False
     climax_fast_monitor_enabled: bool = False
@@ -87,7 +94,7 @@ class AppConfig(BaseModel):
     volume_climax_min_ret_15m_pct: float = 12.0
     volume_climax_min_volume_ratio: float = 3.0
     volume_climax_min_volume_zscore: float = 2.5
-    volume_climax_min_price_change_5m_pct: float = 3.0
+    volume_climax_min_ret_5m_pct: float = 3.0
     volume_climax_max_oi_change_5m_pct: float = -1.0
     volume_climax_min_rejection_pct: float = 2.0
     volume_climax_max_entry_distance_below_high_pct: float = 20.0
@@ -228,6 +235,44 @@ class AppConfig(BaseModel):
         if self.grade_c_mode not in {"watch_only", "suppress"}:
             raise ValueError("grade_c_mode must be one of watch_only, suppress")
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_volume_climax_threshold(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        normalized = dict(values)
+        legacy_value = normalized.pop("volume_climax_min_price_change_5m_pct", None)
+        if legacy_value is None:
+            return normalized
+        canonical_value = normalized.get("volume_climax_min_ret_5m_pct")
+        if canonical_value is None:
+            normalized["volume_climax_min_ret_5m_pct"] = legacy_value
+        elif _is_historical_volume_climax_conflict(canonical_value, legacy_value):
+            normalized["volume_climax_min_ret_5m_pct"] = legacy_value
+        elif not _config_values_equal(canonical_value, legacy_value):
+            raise ValueError(
+                "conflicting volume climax 5m thresholds: use volume_climax_min_ret_5m_pct only"
+            )
+        logger.warning(
+            "Deprecated config key volume_climax_min_price_change_5m_pct was migrated to "
+            "volume_climax_min_ret_5m_pct"
+        )
+        return normalized
+
+
+def _is_historical_volume_climax_conflict(canonical_value: Any, legacy_value: Any) -> bool:
+    try:
+        return float(canonical_value) == 8.0 and float(legacy_value) == 3.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _config_values_equal(left: Any, right: Any) -> bool:
+    try:
+        return float(left) == float(right)
+    except (TypeError, ValueError):
+        return left == right
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:

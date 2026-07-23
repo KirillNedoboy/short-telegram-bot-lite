@@ -247,10 +247,11 @@ The `signals` row itself is append-only in current behavior.
 - signal-time feature snapshot: `signals.context_json`
 - event-detection snapshot: `event_states.event_features_snapshot`
 
-### Telegram payload
+### `telegram_delivery_outbox`
 
-- exact message text is **not** persisted
-- only `signals.telegram_sent` is stored
+`TelegramDeliveryOutboxModel` is the durable delivery queue for newly emitted signal and WATCH rows. It stores `entity_type`, `entity_id`, `channel`, immutable `payload`, `idempotency_key`, `status`, `attempt_count`, `next_attempt_at`, `last_attempt_at`, `lease_until`, `sent_at`, `last_error`, and `created_at`.
+
+Delivery is at-least-once, not exactly-once: if Telegram accepts a request but the acknowledgement is lost, a retry can duplicate the message. Historical rows with `telegram_sent=false` are not backfilled into this table automatically.
 
 ## Denormalization Notes
 
@@ -264,9 +265,8 @@ This is useful for analytics because it avoids needing joins for common score/fe
 
 ## Entities Not Found as Dedicated Storage
 
-The following were **not** found as standalone persisted entities:
+The following were not found as standalone persisted entities:
 
-- Telegram delivery log table
 - raw market snapshot table
 - raw candle store
 - score audit table
@@ -304,4 +304,4 @@ If a second bot needs side-by-side comparison, these fields are the most importa
 2. `signals` has no `bot_id` or `strategy_id`, so analytics and outcomes cannot distinguish bot origin cleanly.
 3. `signal_outcomes` is keyed only by `signal_id`, which assumes one global signal namespace.
 4. outcome tracking queries recent signals globally, without bot partitioning.
-5. exact Telegram payload is not stored, so message-level baseline vs experiment comparisons are incomplete.
+5. delivery state is not namespaced by bot or strategy, so parallel bot comparisons remain incomplete.

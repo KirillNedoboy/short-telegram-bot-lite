@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta, datetime, timezone
 
+import pytest
 from sqlalchemy import select
 
 from app.config import AppConfig
 from app.domain import EventStatus, ShortZone, SignalType
 from app.main import ShortSignalBot
+from app.signals.climax import ClimaxEvaluation
 from app.storage.db import Database
 from app.storage.models import RejectStatModel, SignalModel, TelegramDeliveryOutboxModel, WatchCandidateModel
 from app.storage.repository import BotRepository
@@ -166,6 +168,114 @@ def test_process_symbol_persists_signal_and_suppresses_duplicates(
     assert duplicate_decision is None
     assert duplicate_state is not None
     assert len(notifier.messages) == 1
+
+
+def test_disabled_baseline_delivery_gate_has_no_signal_side_effects(
+    tmp_path,
+    make_event_state,
+    make_features,
+) -> None:
+    async def _run() -> tuple[object | None, object, list[str], int, int]:
+        database = Database(f"sqlite:///{tmp_path / 'disabled-baseline.db'}")
+        database.create_all()
+        repository = BotRepository(database)
+        notifier = _FakeNotifier()
+        bot = ShortSignalBot(
+            config=AppConfig(baseline_live_delivery_enabled=False),
+            repository=repository,
+            scanner=_FakeScanner(),
+            notifier=notifier,
+        )
+        state = repository.upsert_event_state(make_event_state(state=EventStatus.PULLBACK_OBSERVED))
+        features = make_features(asof=state.updated_at)
+        bot._pump_detector.build_event = lambda *_args, **_kwargs: None
+        bot._feature_builder.build = lambda *_args, **_kwargs: features
+
+        decision, updated_state = await bot._process_symbol("ONTUSDT", object(), state)
+        with database.session() as session:
+            signal_count = len(session.scalars(select(SignalModel)).all())
+            outbox_count = len(session.scalars(select(TelegramDeliveryOutboxModel)).all())
+        return decision, updated_state, notifier.messages, signal_count, outbox_count
+
+    decision, state, messages, signal_count, outbox_count = asyncio.run(_run())
+
+    assert decision is None
+    assert state.signal_id is None
+    assert state.state != EventStatus.SIGNAL_SENT
+    assert messages == []
+    assert signal_count == 0
+    assert outbox_count == 0
+
+
+@pytest.mark.parametrize(
+    ("subtype", "gate_name", "delivery_enabled"),
+    [
+        ("VOLUME_CLIMAX_UNWIND", "volume_climax_live_delivery_enabled", False),
+        ("LOW_VOLUME_EXTENSION_FAILURE", "low_volume_live_delivery_enabled", False),
+        ("VOLUME_CLIMAX_UNWIND", "volume_climax_live_delivery_enabled", True),
+        ("LOW_VOLUME_EXTENSION_FAILURE", "low_volume_live_delivery_enabled", True),
+    ],
+)
+def test_disabled_climax_delivery_gates_have_no_signal_side_effects(
+    tmp_path,
+    make_event_state,
+    make_features,
+    monkeypatch,
+    subtype: str,
+    gate_name: str,
+    delivery_enabled: bool,
+) -> None:
+    async def _run() -> tuple[object | None, object, list[str], int, int]:
+        database = Database(f"sqlite:///{tmp_path / f'disabled-{subtype}.db'}")
+        database.create_all()
+        repository = BotRepository(database)
+        notifier = _FakeNotifier()
+        config = AppConfig(
+            climax_short_enabled=True,
+            volume_climax_lifecycle_shadow_enabled=False,
+            **{gate_name: delivery_enabled},
+        )
+        bot = ShortSignalBot(config=config, repository=repository, scanner=_FakeScanner(), notifier=notifier)
+        state = repository.upsert_event_state(make_event_state())
+        features = make_features(asof=state.updated_at)
+        evaluation = ClimaxEvaluation(
+            subtype=subtype,
+            score=70,
+            grade="B",
+            metadata={
+                "strategy_subtype": subtype,
+                "model_version": "climax-v1",
+                "event_high": state.event_high,
+                "entry_distance_below_high_pct": ((state.event_high - features.price) / state.event_high * 100),
+                "volume_climax_observed": False,
+            },
+            veto_reasons=[],
+            data_quality=[],
+        )
+        monkeypatch.setattr("app.main.evaluate_climax", lambda *_args, **_kwargs: evaluation)
+
+        decision = await bot._evaluate_and_send_climax("ONTUSDT", object(), state, features=features)
+        with database.session() as session:
+            signal_count = len(session.scalars(select(SignalModel)).all())
+            outbox_count = len(session.scalars(select(TelegramDeliveryOutboxModel)).all())
+        return decision, state, notifier.messages, signal_count, outbox_count
+
+    decision, state, messages, signal_count, outbox_count = asyncio.run(_run())
+
+    if delivery_enabled:
+        assert decision is not None
+        assert state.signal_id is not None
+        assert state.state == EventStatus.SIGNAL_SENT
+        assert len(messages) == 1
+        assert signal_count == 1
+        assert outbox_count == 1
+    else:
+        assert decision is None
+        assert state.signal_id is None
+        assert state.state != EventStatus.SIGNAL_SENT
+        assert messages == []
+        assert signal_count == 0
+        assert outbox_count == 0
 
 
 def test_storage_heartbeat_failure_sends_alert() -> None:

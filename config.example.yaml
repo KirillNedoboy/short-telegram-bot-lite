@@ -51,6 +51,13 @@ enable_watch_candidates: false
 send_watch_to_telegram: false
 watch_min_score: 45
 watch_max_per_cycle: 5
+# Live V1 strategy delivery gates. WATCH delivery remains separately disabled above.
+baseline_live_delivery_enabled: true
+volume_climax_live_delivery_enabled: true
+low_volume_live_delivery_enabled: true
+# VOLUME_CLIMAX_LIFECYCLE_SHADOW_V2 remains research-only.
+volume_climax_lifecycle_shadow_enabled: true
+volume_climax_min_ret_5m_pct: 3.0
 enable_squeeze_guard: true
 squeeze_guard_mode: warn_only
 retest_not_failed_penalty: 4

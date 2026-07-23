@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import yaml
 
 from app.domain import SignalOutcome
 from app.scripts.short_derivatives_report import main as derivatives_report_main
@@ -16,7 +17,21 @@ from app.storage.repository import BotRepository
 
 
 def _write_config(tmp_path: Path, db_path: Path) -> None:
-    (tmp_path / "config.yaml").write_text(f'db_url: "sqlite:///{db_path}"\n', encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"db_url": f"sqlite:///{db_path.as_posix()}"}, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def test_write_config_serializes_windows_unsafe_paths_as_valid_yaml(tmp_path) -> None:
+    directory = tmp_path / "Рабочий стол" / "reports db"
+    directory.mkdir(parents=True)
+    db_path = directory / "bot.sqlite"
+
+    _write_config(tmp_path, db_path)
+
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert config["db_url"] == f"sqlite:///{db_path.as_posix()}"
 
 
 def _seed_reject_rows(repository: BotRepository) -> None:

@@ -1,10 +1,14 @@
 # LLM handoff guide
 
-Use `docs/project-brief.md` as the primary project/strategy/safety overview when giving the repository to another LLM. This file remains the compact procedural entry point.
+Use the current architecture, pipeline, and data-model documents below as the source of truth for runtime behavior. Historical research reports are evidence, not current architecture documentation.
 
 ## Mission
 
 This is a read-only Telegram signal bot for Bybit USDT perpetual contracts. It scans markets, detects post-pump short setups, scores signals, sends alerts, and stores observations/outcomes. It does not place orders automatically.
+
+Live V1 strategies are `BASELINE_PULLBACK`, `VOLUME_CLIMAX_UNWIND`, and `LOW_VOLUME_EXTENSION_FAILURE`; their delivery gates default to `true`. `VOLUME_CLIMAX_LIFECYCLE_SHADOW_V2` is research-only. WATCH Telegram delivery defaults to `false`.
+
+Telegram uses the persistent `telegram_delivery_outbox` with at-least-once delivery. A retry can duplicate a message after an ambiguous network acknowledgement.
 
 ## Read first
 

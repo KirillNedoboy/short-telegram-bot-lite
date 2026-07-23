@@ -62,7 +62,7 @@ Main orchestration sits in `app/main.py` inside `ShortSignalBot`. The code is mo
    - fetch recent 1m candles for that union
    - process each symbol through the event/signal pipeline
    - persist any event-state updates
-   - send Telegram and persist any emitted signal
+   - persist emitted signals and their delivery intent, then send Telegram from the outbox
    - refresh due outcomes for already-saved signals
 4. `run_forever()` sleeps `scan_interval_sec` between cycles.
 
@@ -203,7 +203,9 @@ This is evidence of external service management, but the actual service definiti
 - client: `app/notifications/telegram.py`
 - message payload formatting: `app/signals/formatter.py`
 - send call: `app/main.py`
-- persisted send result: `signals.telegram_sent`
+- delivery policy: the three live V1 strategy gates default to `true`; WATCH remains controlled by `send_watch_to_telegram=false`
+- persistent outbox: `TelegramDeliveryOutboxModel` / `telegram_delivery_outbox`
+- semantics: at-least-once; an ambiguous network acknowledgement can produce a duplicate Telegram message
 
 ### Bybit
 
@@ -271,5 +273,5 @@ This is evidence of external service management, but the actual service definiti
 1. `event_states` is keyed only by `symbol`, so only one tracked event namespace exists per symbol.
 2. `signals` and `signal_outcomes` have no `bot_id`, `strategy_id`, or namespace column.
 3. Outcome refresh scans recent signals without any bot partitioning.
-4. Exact Telegram payload text is not stored, only `telegram_sent`.
+4. Signal rows do not include a bot or strategy namespace; the delivery payload is stored separately in the outbox.
 5. Raw market data is not persisted, so deep replay/comparison depends on live re-fetch or exported snapshots.
