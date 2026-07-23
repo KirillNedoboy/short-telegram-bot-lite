@@ -193,17 +193,18 @@ This is the effective signal path from live market data to Telegram and later to
      - current code has `grade`, not a separate `tier`
      - `trigger_window`, `signal_type`, and `grade` are different concepts
 
-19. **Persist signal before attempting Telegram delivery**
-   - File: `app/storage/repository.py`
-   - Function: `BotRepository.save_signal()`
-   - The row is created with `telegram_sent=False` before transport is attempted.
+19. **Persist signal and delivery intent before Telegram**
+   - Files: `app/storage/repository.py`, `app/storage/models.py`
+   - Functions: `BotRepository.save_signal()`, `BotRepository.save_watch_candidate()`
+   - The source row is created with `telegram_sent=False` and, for enabled delivery, an immutable `telegram_delivery_outbox` payload in the same transaction.
 
-20. **Send Telegram and persist the delivery result**
-   - File: `app/notifications/telegram.py`
-   - Function: `TelegramNotifier.send_signal()`
-   - Call site: `app/main.py`
-   - After the attempt, `telegram_sent` is updated with the actual result.
-   - A notifier exception therefore leaves a durable row with `telegram_sent=False`.
+20. **Claim, send, and reconcile Telegram delivery**
+   - File: `app/main.py`
+   - Functions: `_send_new_delivery()`, `_drain_delivery_outbox()`, `_deliver_outbox_item()`
+   - Delivery claims use a lease and bounded retry state.
+   - Success atomically marks outbox `SENT` and source `telegram_sent=True`.
+   - `False`/exception persists `RETRY`; five attempts become `DEAD`.
+   - The outbox is at-least-once and does not auto-enqueue historical unsent rows.
 
 21. **Persist signal evidence**
    - Stored data includes:

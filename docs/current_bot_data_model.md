@@ -84,13 +84,16 @@ Key fields:
 | `oi_change_1h` | nullable | Optional derivatives field. |
 | `funding_rate` | nullable | Optional derivatives field. |
 | `context_json` | yes | Full feature snapshot plus reasons, risk flags, core filters, score breakdown. |
-| `telegram_sent` | yes | Boolean send result only. |
+| `telegram_sent` | yes | Source-row delivery result flag; not a retry queue. |
 | `created_at` | yes | Insert timestamp. |
+
+For newly emitted rows with Telegram delivery enabled, `telegram_delivery_outbox` stores the immutable payload and retry state. Historical rows with `telegram_sent=false` are not automatically enqueued.
 
 Write timing:
 
 - inserted once at signal emission by `BotRepository.save_signal()`
-- not updated later by current runtime
+- `telegram_sent` is updated atomically with outbox `SENT` after delivery
+- retry/dead-letter metadata is stored in `telegram_delivery_outbox`
 
 ### `signal_outcomes`
 

@@ -172,15 +172,18 @@ Important persistence families:
 - outcome rows;
 - monitor heartbeat/observability records.
 
-For actionable signal and WATCH delivery, the durable ordering is:
+For actionable signal and enabled WATCH delivery, the durable ordering is:
 
 ```text
-1. save row with telegram_sent = False
-2. attempt Telegram delivery
-3. update telegram_sent with the actual result
+1. render and save the immutable source row with telegram_sent = False
+2. save a matching telegram_delivery_outbox row in the same transaction
+3. claim the outbox row with a lease
+4. attempt Telegram delivery
+5. atomically mark outbox SENT and source telegram_sent = True
+   or persist RETRY/DEAD with bounded backoff
 ```
 
-This prevents a delivered message from having no durable row and preserves an audit row when Telegram delivery raises an exception.
+The outbox is new-only. Historical `telegram_sent = False` rows are not automatically enqueued because their exact payload and delivery intent cannot be reconstructed safely. Delivery is at-least-once, not exactly-once: a crash after Telegram accepts a message but before the local `SENT` commit can produce a duplicate on retry. `telegram_sent` alone is a source-row result flag, not a delivery queue.
 
 SQLite lifecycle terminal transitions use `BEGIN IMMEDIATE` around read-check-update-event sequences. Startup reconciliation runs after storage health verification and reports expired rows, newly detected orphans, duplicate terminal-event groups, and explicit reconciliation failure.
 
