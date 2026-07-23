@@ -169,6 +169,23 @@ def test_delivery_lease_expiry_requeues_item(tmp_path, make_event_state, make_si
     assert second[0]["attempt_count"] == 2
 
 
+def test_delivery_lease_expiry_after_max_attempts_becomes_dead(tmp_path, make_event_state, make_signal_decision) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'lease-dead.db'}")
+    database.create_all()
+    repository = BotRepository(database)
+    state = repository.upsert_event_state(make_event_state())
+    repository.save_signal(make_signal_decision(), state, telegram_sent=False, delivery_payload="payload")
+    now = datetime.now(timezone.utc)
+
+    claimed = None
+    for attempt in range(5):
+        claimed = repository.claim_due_deliveries(now + timedelta(seconds=attempt * 2), limit=1, lease_seconds=1)
+        assert len(claimed) == 1
+    assert repository.claim_due_deliveries(now + timedelta(seconds=12), limit=1, lease_seconds=1) == []
+    with database.session() as session:
+        assert session.scalars(select(TelegramDeliveryOutboxModel)).one().status == "DEAD"
+
+
 def test_delivery_success_updates_source_and_outbox_atomically(tmp_path, make_event_state, make_signal_decision) -> None:
     database = Database(f"sqlite:///{tmp_path / 'outbox-success.db'}")
     database.create_all()

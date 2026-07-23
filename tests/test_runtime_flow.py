@@ -6,7 +6,7 @@ from datetime import timedelta, datetime, timezone
 from sqlalchemy import select
 
 from app.config import AppConfig
-from app.domain import EventStatus, ShortZone
+from app.domain import EventStatus, ShortZone, SignalType
 from app.main import ShortSignalBot
 from app.storage.db import Database
 from app.storage.models import RejectStatModel, SignalModel, TelegramDeliveryOutboxModel, WatchCandidateModel
@@ -96,6 +96,26 @@ def test_notifier_failure_leaves_signal_retryable_in_outbox(tmp_path, make_event
     assert sent is False
     assert state[0] is False
     assert state[1:] == ("RETRY", 1, "RuntimeError: telegram transport down")
+
+
+def test_disabled_watch_delivery_is_not_drained(tmp_path, make_event_state, make_signal_decision) -> None:
+    async def _run() -> tuple[list[str], str]:
+        database = Database(f"sqlite:///{tmp_path / 'watch-drain.db'}")
+        database.create_all()
+        repository = BotRepository(database)
+        state = repository.upsert_event_state(make_event_state())
+        decision = make_signal_decision(signal_type=SignalType.WATCH, actionable=False, decision_type="WATCH")
+        watch = repository.save_watch_candidate(decision, state, telegram_sent=False, delivery_payload="watch payload")
+        notifier = _FakeNotifier()
+        bot = ShortSignalBot(config=AppConfig(send_watch_to_telegram=False), repository=repository, scanner=_FakeScanner(), notifier=notifier)
+        await bot._drain_delivery_outbox(limit=5)
+        with database.session() as session:
+            outbox = session.scalars(select(TelegramDeliveryOutboxModel)).one()
+        return notifier.messages, outbox.status
+
+    messages, status = asyncio.run(_run())
+    assert messages == []
+    assert status == "PENDING"
 
 
 class _FailingRepository:

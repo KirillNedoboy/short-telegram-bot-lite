@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+import logging
 
 from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.engine import make_url
@@ -15,6 +16,8 @@ from app.storage.models import Base
 
 DEFAULT_SQLITE_JOURNAL_MODE = "WAL"
 DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5_000
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -117,7 +120,14 @@ class Database:
             if "signals" in columns_by_table:
                 index_names = {index["name"] for index in inspect(self.engine).get_indexes("signals")}
                 constraint_names = {constraint["name"] for constraint in inspect(self.engine).get_unique_constraints("signals")}
-                if "uq_signal_enriched_identity" not in index_names and "uq_signal_enriched_identity" not in constraint_names:
+                duplicate = connection.exec_driver_sql(
+                    "SELECT 1 FROM signals "
+                    "WHERE strategy_subtype IS NOT NULL AND model_version IS NOT NULL "
+                    "GROUP BY symbol, event_id, strategy_subtype, model_version HAVING COUNT(*) > 1 LIMIT 1"
+                ).first()
+                if duplicate:
+                    logger.error("Skipping enriched signal identity index: existing duplicate rows require explicit repair")
+                elif "uq_signal_enriched_identity" not in index_names and "uq_signal_enriched_identity" not in constraint_names:
                     connection.exec_driver_sql(
                         "CREATE UNIQUE INDEX uq_signal_enriched_identity "
                         "ON signals(symbol, event_id, strategy_subtype, model_version)"

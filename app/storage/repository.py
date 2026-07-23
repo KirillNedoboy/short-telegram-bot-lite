@@ -443,6 +443,19 @@ class BotRepository:
             session.query(TelegramDeliveryOutboxModel).filter(
                 TelegramDeliveryOutboxModel.status == "IN_FLIGHT",
                 TelegramDeliveryOutboxModel.lease_until <= now,
+                TelegramDeliveryOutboxModel.attempt_count >= 5,
+            ).update(
+                {
+                    TelegramDeliveryOutboxModel.status: "DEAD",
+                    TelegramDeliveryOutboxModel.lease_until: None,
+                    TelegramDeliveryOutboxModel.last_error: "delivery_lease_expired_after_max_attempts",
+                },
+                synchronize_session=False,
+            )
+            session.query(TelegramDeliveryOutboxModel).filter(
+                TelegramDeliveryOutboxModel.status == "IN_FLIGHT",
+                TelegramDeliveryOutboxModel.lease_until <= now,
+                TelegramDeliveryOutboxModel.attempt_count < 5,
             ).update(
                 {
                     TelegramDeliveryOutboxModel.status: "RETRY",

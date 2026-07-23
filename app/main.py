@@ -209,15 +209,28 @@ class ShortSignalBot:
         return False
 
     async def _drain_delivery_outbox(self, *, limit: int = 5) -> int:
-        claimed = self._repository.claim_due_deliveries(
+        delivered = 0
+        signal_claims = self._repository.claim_due_deliveries(
             datetime.now(timezone.utc),
             limit=limit,
             lease_seconds=120,
+            entity_type="SIGNAL",
         )
-        delivered = 0
-        for delivery in claimed:
+        for delivery in signal_claims:
             if await self._deliver_outbox_item(delivery):
                 delivered += 1
+        watch_budget = max(0, self._config.watch_max_per_cycle - self._watch_sent_in_cycle)
+        if self._config.send_watch_to_telegram and watch_budget:
+            watch_claims = self._repository.claim_due_deliveries(
+                datetime.now(timezone.utc),
+                limit=min(limit, watch_budget),
+                lease_seconds=120,
+                entity_type="WATCH",
+            )
+            for delivery in watch_claims:
+                if await self._deliver_outbox_item(delivery):
+                    self._watch_sent_in_cycle += 1
+                    delivered += 1
         return delivered
 
     async def _send_new_delivery(self, *, entity_type: str, entity_id: int) -> bool:
