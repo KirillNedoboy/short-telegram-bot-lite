@@ -56,6 +56,21 @@ def build_shortlist(
     return ranked[:shortlist_size]
 
 
+def round_robin_slice(
+    snapshots: Iterable[MarketSnapshot],
+    cursor: int,
+    batch_size: int,
+) -> tuple[list[MarketSnapshot], int]:
+    """Return a deterministic shadow-only slice covering every eligible symbol."""
+    ordered = sorted(snapshots, key=lambda item: item.symbol)
+    if not ordered or batch_size <= 0:
+        return [], 0
+    start = cursor % len(ordered)
+    selected = [ordered[(start + offset) % len(ordered)] for offset in range(min(batch_size, len(ordered)))]
+    next_cursor = (start + len(selected)) % len(ordered)
+    return selected, next_cursor
+
+
 def _velocity_score(current: MarketSnapshot, previous: MarketSnapshot | None) -> float:
     if previous is None or previous.last_price <= 0:
         return 0.0

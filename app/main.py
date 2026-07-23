@@ -62,9 +62,9 @@ def _decision_delta(live: ClimaxEvaluation, shadow: ClimaxEvaluation | None) -> 
     if shadow is None:
         return None
     if live.actionable and shadow.actionable:
-        return "GRADE_CHANGED" if live.grade != shadow.grade else "UNCHANGED_ACTIONABLE"
+        return "BOTH_ACTIONABLE"
     if not live.actionable and not shadow.actionable:
-        return "UNCHANGED_REJECTED"
+        return "BOTH_REJECTED"
     if not live.actionable and shadow.actionable:
         return "LIVE_REJECTED_SHADOW_ACTIONABLE"
     return "LIVE_ACTIONABLE_SHADOW_REJECTED"
@@ -596,7 +596,7 @@ class ShortSignalBot:
             state.event_features_snapshot = snapshot
             self._state_store.save(state)
             attempt_state = "EXPIRED" if lifecycle_shadow.expired else "SHADOW_ACTIONABLE" if lifecycle_shadow.state == "FALLBACK_READY" else "RETEST_IN_PROGRESS"
-            self._repository.upsert_shadow_entry_attempt(
+            attempt_persisted = self._repository.upsert_shadow_entry_attempt(
                 attempt_id=lifecycle_attempt_id,
                 root_event_id=root_event_id,
                 observed_at=features.asof,
@@ -609,8 +609,12 @@ class ShortSignalBot:
                 event_revision=lifecycle_shadow.event_revision,
                 runtime_instance_id=self._runtime_instance_id,
                 model_version="climax-lifecycle-v1-shadow",
+                max_attempts_per_root_event=self._config.climax_max_attempts_per_root_event,
             )
-            if attempt_state == "SHADOW_ACTIONABLE":
+            if not attempt_persisted:
+                lifecycle_attempt_id = None
+                shadow_attempt_id = None
+            if attempt_state == "SHADOW_ACTIONABLE" and attempt_persisted:
                 self._repository.transition_shadow_entry_attempt(
                     attempt_id=lifecycle_attempt_id,
                     root_event_id=root_event_id,
@@ -634,7 +638,7 @@ class ShortSignalBot:
                     attempt_state = "BREAKDOWN_PENDING"
                 else:
                     attempt_state = "RETEST_IN_PROGRESS"
-                self._repository.upsert_shadow_entry_attempt(
+                attempt_persisted = self._repository.upsert_shadow_entry_attempt(
                     attempt_id=shadow_attempt_id,
                     root_event_id=root_event_id,
                     event_revision=event_revision,
@@ -645,7 +649,10 @@ class ShortSignalBot:
                     confirmation_expires_at=evaluated_at + timedelta(minutes=self._config.climax_entry_attempt_ttl_minutes),
                     runtime_instance_id=self._runtime_instance_id,
                     model_version=str(shadow_data.get("model_version", "climax-v1")),
+                    max_attempts_per_root_event=self._config.climax_max_attempts_per_root_event,
                 )
+                if not attempt_persisted:
+                    shadow_attempt_id = None
             else:
                 shadow_attempt_id = self._repository.get_open_shadow_attempt_id(root_event_id=root_event_id)
                 if shadow_attempt_id:
@@ -735,6 +742,31 @@ class ShortSignalBot:
             shadow_hypothetical_score=shadow_evaluation.score if shadow_evaluation else None,
             shadow_removed_vetoes=(sorted(set(evaluation.veto_reasons) - set(shadow_evaluation.veto_reasons)) if shadow_evaluation else None),
         )
+        if evaluation.metadata.get("volume_climax_observed"):
+            volume_metadata = dict(evaluation.metadata.get("volume_climax_metadata") or {})
+            volume_candidate = bool(evaluation.metadata.get("volume_climax_candidate"))
+            volume_actionable = bool(evaluation.metadata.get("volume_climax_actionable"))
+            volume_stage = "ACTIONABLE" if volume_actionable else "CANDIDATE" if volume_candidate else "OBSERVED"
+            volume_vetoes = list(evaluation.veto_reasons) if not volume_candidate else []
+            self._repository.record_volume_climax_observation(
+                observed_at=evaluated_at,
+                market_asof=features.asof,
+                symbol=symbol,
+                event_id=state.event_id,
+                root_event_id=root_event_id,
+                event_revision=event_revision,
+                runtime_instance_id=self._runtime_instance_id,
+                model_version=str(volume_metadata.get("model_version", "climax-v1")),
+                subtype=str(volume_metadata.get("strategy_subtype", "VOLUME_CLIMAX_UNWIND")),
+                stage=volume_stage,
+                score=int(evaluation.metadata.get("volume_climax_score", evaluation.score)),
+                grade=str(evaluation.metadata.get("volume_climax_grade", evaluation.grade)),
+                veto_reasons=list(evaluation.metadata.get("volume_climax_veto_reasons", volume_vetoes)),
+                data_quality=list(evaluation.data_quality),
+                metadata=volume_metadata,
+                source_evaluation_id=evaluation_id,
+                attempt_id=shadow_attempt_id,
+            )
         if self._config.climax_root_event_tracking_enabled and lifecycle_shadow is None:
             lifecycle_model_version = str((shadow_evaluation.metadata if shadow_evaluation else evaluation.metadata).get("model_version", "climax-v1"))
             if shadow_attempt_id is None:

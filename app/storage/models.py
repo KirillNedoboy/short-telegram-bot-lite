@@ -227,6 +227,31 @@ class ClimaxEvaluationModel(Base):
     shadow_removed_vetoes_json: Mapped[list] = mapped_column(JSON, default=list)
 
 
+class VolumeClimaxObservationModel(Base):
+    """Independent append-only ledger for every volume-climax observation."""
+
+    __tablename__ = "volume_climax_observations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    market_asof: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    event_id: Mapped[str] = mapped_column(String(128), index=True)
+    root_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    event_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    runtime_instance_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    model_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    subtype: Mapped[str] = mapped_column(String(64), index=True)
+    stage: Mapped[str] = mapped_column(String(16), index=True)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    grade: Mapped[str] = mapped_column(String(1), default="C")
+    veto_reasons_json: Mapped[list] = mapped_column(JSON, default=list)
+    data_quality_json: Mapped[list] = mapped_column(JSON, default=list)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_evaluation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    attempt_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+
+
 class ClimaxRootEventModel(Base):
     """Durable V3C root-event identity; shadow-only until explicitly activated."""
 

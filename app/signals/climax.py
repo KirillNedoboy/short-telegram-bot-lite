@@ -140,6 +140,7 @@ def evaluate_climax(
     *,
     frozen_initial_extension_pct: float | None = None,
     current_ret5_gate_enabled: bool = True,
+    strict_closed_candles: bool = False,
 ) -> ClimaxEvaluation:
     """Evaluate both climax patterns; required gates run before score.
 
@@ -151,6 +152,7 @@ def evaluate_climax(
         features,
         frame,
         confirmation_window_minutes=getattr(config, "volume_climax_confirmation_window_minutes", 3),
+        strict_closed_candles=strict_closed_candles,
     )
     candidates: list[ClimaxEvaluation] = []
     volume_candidate: ClimaxEvaluation | None = None
@@ -169,9 +171,13 @@ def evaluate_climax(
             )
         )
     def with_volume_context(selected: ClimaxEvaluation) -> ClimaxEvaluation:
-        if volume_candidate is not None and volume_candidate.score >= config.climax_min_signal_score:
+        if volume_candidate is not None:
             selected.metadata["volume_climax_observed"] = True
             selected.metadata["volume_climax_candidate"] = not volume_candidate.veto_reasons
+            selected.metadata["volume_climax_actionable"] = volume_candidate.actionable
+            selected.metadata["volume_climax_score"] = volume_candidate.score
+            selected.metadata["volume_climax_grade"] = volume_candidate.grade
+            selected.metadata["volume_climax_veto_reasons"] = list(volume_candidate.veto_reasons)
             selected.metadata["volume_climax_metadata"] = dict(volume_candidate.metadata)
         return selected
 
@@ -181,7 +187,7 @@ def evaluate_climax(
     vetoed = [item for item in candidates if item.veto_reasons]
     if vetoed:
         return with_volume_context(max(vetoed, key=lambda item: item.score))
-    return ClimaxEvaluation(None, 0, "C", base, ["no_climax_admission"], [])
+    return with_volume_context(ClimaxEvaluation(None, 0, "C", base, ["no_climax_admission"], []))
 
 
 def _common_metadata(
@@ -190,10 +196,24 @@ def _common_metadata(
     frame: pd.DataFrame,
     *,
     confirmation_window_minutes: int = 3,
+    strict_closed_candles: bool = False,
 ) -> dict[str, Any]:
     timestamps = pd.Series(pd.to_datetime(frame["timestamp"], utc=True, errors="coerce"), index=frame.index) if "timestamp" in frame else pd.Series(pd.to_datetime(frame.index, utc=True, errors="coerce"), index=frame.index)
     asof_utc = pd.Timestamp(features.asof).tz_convert("UTC")
-    latest_closed = frame.loc[timestamps <= asof_utc].copy()
+    legacy_mask = timestamps <= asof_utc
+    valid_timestamps = timestamps.dropna().sort_values()
+    interval = valid_timestamps.diff().dropna().median() if len(valid_timestamps) >= 2 else pd.Timedelta(minutes=1)
+    if pd.isna(interval) or interval <= pd.Timedelta(0):
+        interval = pd.Timedelta(minutes=1)
+    close_times = timestamps + interval
+    strict_closed_mask = close_times <= asof_utc
+    closed_mask = strict_closed_mask if strict_closed_candles else legacy_mask
+    latest_closed = frame.loc[closed_mask].copy()
+    last_closed_close_time = (
+        close_times.loc[strict_closed_mask].max()
+        if strict_closed_candles and bool(strict_closed_mask.any())
+        else timestamps.loc[legacy_mask].max() if bool(legacy_mask.any()) else None
+    )
     high = float(max(state.event_high or 0.0, float(latest_closed["high"].max()) if not latest_closed.empty else 0.0))
     previous_high = float(state.event_high or high)
     previous_window = latest_closed.iloc[-10:-5] if len(latest_closed) >= 10 else latest_closed.iloc[:-5]
@@ -247,6 +267,8 @@ def _common_metadata(
         "volume_window_current_candles": len(current_window),
         "closed_candles_after_high": post_high_count,
         "post_high_closes": post_high_closes,
+        "partial_candle_excluded": bool(len(frame) and not bool(closed_mask.iloc[-1])),
+        "last_closed_candle_close_time": last_closed_close_time.isoformat() if last_closed_close_time is not None else None,
         "post_high_high": post_high_high,
         "post_high_retest_high": post_high_retest_high,
         "breakout_reference": breakout_reference,
@@ -413,6 +435,7 @@ def evaluate_climax_shadow(
         config,
         frozen_initial_extension_pct=frozen_value,
         current_ret5_gate_enabled=False,
+        strict_closed_candles=True,
     )
 
 

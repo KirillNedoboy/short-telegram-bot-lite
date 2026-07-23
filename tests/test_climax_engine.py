@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.signals.climax import evaluate_climax, evaluate_climax_shadow
 
@@ -83,6 +83,49 @@ def test_volume_climax_ake_admits(make_features, make_event_state, make_frame):
     assert result.grade in {"A", "B"}
 
 
+def test_volume_climax_uses_canonical_five_minute_threshold(make_features, make_event_state, make_frame):
+    features = make_features(
+        ret_5m=4.0,
+        ret_15m=15.0,
+        vol_zscore_30m=8.0,
+        oi_change_pct=-4.0,
+        derivatives_status="OK",
+        rejection_from_high_pct=3.0,
+    )
+    result = evaluate_climax(
+        make_event_state(),
+        features,
+        make_frame([100 + i * 0.1 for i in range(30)]),
+        _config(volume_climax_min_price_change_5m_pct=5.0, low_volume_extension_enabled=False),
+    )
+    assert "price_acceleration_below_threshold" in result.veto_reasons
+
+
+def test_low_score_volume_observation_is_retained(make_features, make_event_state, make_frame):
+    state = make_event_state(event_features_snapshot={"previous_leg_volume": 1000.0})
+    features = make_features(
+        ret_5m=3.0,
+        ret_15m=12.0,
+        vol_zscore_30m=1.0,
+        oi_change_pct=-0.5,
+        derivatives_status="OK",
+        rejection_from_high_pct=2.0,
+        current_volume=3000.0,
+        latest_failed_retest=False,
+    )
+    result = evaluate_climax(
+        state,
+        features,
+        make_frame([100 + i * 0.1 for i in range(30)]),
+        _config(low_volume_extension_enabled=False),
+    )
+    assert not result.actionable
+    assert result.metadata["volume_climax_observed"] is True
+    assert result.metadata["volume_climax_candidate"] is True
+    assert result.metadata["volume_climax_actionable"] is False
+    assert result.metadata["volume_climax_score"] < 70
+
+
 def test_m1_only_divergence_no_actionable(make_features, make_event_state, make_frame):
     features = make_features(ret_5m=10.0, ret_15m=15.0, vol_zscore_30m=8.0, oi_change_pct=None, derivatives_status="MISSING", rejection_from_high_pct=3.0)
     result = evaluate_climax(make_event_state(), features, make_frame([100 + i * 0.1 for i in range(30)]), _config(low_volume_extension_enabled=False))
@@ -148,6 +191,28 @@ def test_low_volume_requires_two_closed_candles_after_high(make_features, make_e
     result = evaluate_climax(make_event_state(), features, make_frame([100 + i * 0.1 for i in range(30)]), _config(volume_climax_unwind_enabled=False))
     assert "insufficient_closed_candles_after_high" in result.veto_reasons
     assert result.metadata["oi_confirmation_state"] == "unavailable"
+
+
+def test_climax_metadata_excludes_partial_candle(make_features, make_event_state, make_frame):
+    start = datetime(2026, 4, 13, 12, 0, tzinfo=timezone.utc)
+    frame = make_frame([100 + i for i in range(30)], start=start)
+    features = make_features(
+        asof=start + timedelta(minutes=29, seconds=30),
+        ret_5m=10.0,
+        ret_15m=15.0,
+        vol_zscore_30m=8.0,
+        oi_change_pct=-4.0,
+        derivatives_status="OK",
+        rejection_from_high_pct=3.0,
+    )
+    result = evaluate_climax_shadow(
+        make_event_state(event_high_time=start + timedelta(minutes=25)),
+        features,
+        frame,
+        _config(low_volume_extension_enabled=False),
+    )
+    assert result.metadata["partial_candle_excluded"] is True
+    assert result.metadata["last_closed_candle_close_time"] == (start + timedelta(minutes=29)).isoformat()
 
 
 def test_low_volume_confirmed_second_leg_is_veto(make_features, make_event_state, make_frame):

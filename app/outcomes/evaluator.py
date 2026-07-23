@@ -56,6 +56,45 @@ class OutcomeEvaluator:
         return outcome
 
 
+def evaluate_hypothetical_short(
+    *,
+    entry_time: datetime,
+    entry_price: float,
+    frame_1m: pd.DataFrame,
+) -> dict[str, object]:
+    """Evaluate shadow-only short outcomes from a hypothetical entry."""
+    if entry_price <= 0:
+        raise ValueError("entry_price must be positive")
+    if frame_1m.empty:
+        return {"horizons": {}, "mfe_pct": None, "mae_pct": None, "new_high_after_entry": False}
+
+    future = frame_1m.loc[frame_1m["timestamp"] >= entry_time].copy()
+    if future.empty:
+        return {"horizons": {}, "mfe_pct": None, "mae_pct": None, "new_high_after_entry": False}
+
+    horizons: dict[str, dict[str, float | None]] = {}
+    for label, minutes in (("1m", 1), ("3m", 3), ("5m", 5), ("15m", 15)):
+        target = entry_time + timedelta(minutes=minutes)
+        row = future.loc[future["timestamp"] >= target]
+        horizons[label] = {
+            "price": float(row.iloc[0]["close"]) if not row.empty else None,
+            "short_return_pct": (
+                float((entry_price - row.iloc[0]["close"]) / entry_price * 100)
+                if not row.empty
+                else None
+            ),
+        }
+
+    mfe_pct = float(((entry_price - future["low"]) / entry_price * 100).max())
+    mae_pct = float(((future["high"] - entry_price) / entry_price * 100).max())
+    return {
+        "horizons": horizons,
+        "mfe_pct": mfe_pct,
+        "mae_pct": mae_pct,
+        "new_high_after_entry": bool((future["high"] > entry_price).any()),
+    }
+
+
 def _classify_risk_adjusted(outcome: SignalOutcome) -> str:
     if outcome.mfe_pct is None or outcome.mae_pct is None or outcome.squeeze_extension_pct is None:
         return "INVALID_OR_MISSING"

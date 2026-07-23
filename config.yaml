@@ -69,7 +69,6 @@ climax_min_public_grade: B
 climax_grade_a_score: 85
 climax_max_signal_age_minutes: 15
 volume_climax_unwind_enabled: true
-volume_climax_min_ret_5m_pct: 8.0
 volume_climax_min_ret_15m_pct: 12.0
 volume_climax_min_volume_ratio: 3.0
 volume_climax_min_volume_zscore: 2.5

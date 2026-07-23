@@ -2,10 +2,36 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
+
+from app.outcomes.evaluator import evaluate_hypothetical_short
 from research.climax_replay import load_fixture
 
 
 FIXTURE_PATH = Path("research/fixtures/akeusdt_2026-07-15.json")
+
+
+def test_hypothetical_short_outcomes_include_required_shadow_horizons() -> None:
+    timestamps = pd.date_range("2026-07-15T08:00:00Z", periods=20, freq="min")
+    frame = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [100.0] * 20,
+            "high": [101.0 + i * 0.1 for i in range(20)],
+            "low": [99.0 - i * 0.1 for i in range(20)],
+            "close": [100.0 - i * 0.2 for i in range(20)],
+        }
+    )
+    outcome = evaluate_hypothetical_short(
+        entry_time=timestamps[0].to_pydatetime(),
+        entry_price=100.0,
+        frame_1m=frame,
+    )
+
+    assert set(outcome["horizons"]) == {"1m", "3m", "5m", "15m"}
+    assert outcome["mfe_pct"] > 0
+    assert outcome["mae_pct"] >= 0
+    assert outcome["new_high_after_entry"] is True
 
 
 def test_ake_fixture_is_complete_and_marks_unavailable_microstructure() -> None:

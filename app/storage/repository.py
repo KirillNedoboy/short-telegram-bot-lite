@@ -23,6 +23,7 @@ from app.storage.models import (
     ClimaxEntryAttemptEventModel,
     ClimaxMonitorEventModel,
     ClimaxRootEventModel,
+    VolumeClimaxObservationModel,
     EventStateModel,
     RejectStatModel,
     RuntimeHeartbeatModel,
@@ -428,6 +429,56 @@ class BotRepository:
             session.refresh(model)
             return _outcome_from_model(model)
 
+    def record_volume_climax_observation(
+        self,
+        *,
+        observed_at: datetime,
+        market_asof: datetime | None,
+        symbol: str,
+        event_id: str,
+        root_event_id: str | None,
+        event_revision: int | None,
+        runtime_instance_id: str | None,
+        model_version: str | None,
+        subtype: str,
+        stage: str,
+        score: int,
+        grade: str,
+        veto_reasons: list[str],
+        data_quality: list[str],
+        metadata: dict[str, Any],
+        source_evaluation_id: int | None,
+        attempt_id: str | None,
+    ) -> int | None:
+        """Append every volume-climax family observation independently of selection."""
+        try:
+            with self._db.session() as session:
+                model = VolumeClimaxObservationModel(
+                    observed_at=observed_at,
+                    market_asof=market_asof,
+                    symbol=symbol,
+                    event_id=event_id,
+                    root_event_id=root_event_id,
+                    event_revision=event_revision,
+                    runtime_instance_id=runtime_instance_id or getattr(self, "_runtime_instance_id", None),
+                    model_version=model_version,
+                    subtype=subtype,
+                    stage=stage,
+                    score=score,
+                    grade=grade,
+                    veto_reasons_json=_json_ready(veto_reasons),
+                    data_quality_json=_json_ready(data_quality),
+                    metadata_json=_json_ready(metadata),
+                    source_evaluation_id=source_evaluation_id,
+                    attempt_id=attempt_id,
+                )
+                session.add(model)
+                session.flush()
+                return model.id
+        except Exception:
+            logger.exception("volume observation ledger write failed symbol=%s event_id=%s", symbol, event_id)
+            return None
+
     def record_climax_evaluation(
         self,
         *,
@@ -587,7 +638,8 @@ class BotRepository:
                 return model.peak_revision, model.initial_extension_pct
         except Exception:
             logger.exception("shadow root-event write failed symbol=%s root_event_id=%s", symbol, root_event_id)
-            raise
+            # Shadow telemetry must not veto the live evaluation/sender path.
+            return 1, None
 
     def upsert_shadow_entry_attempt(
         self,
@@ -604,12 +656,45 @@ class BotRepository:
         event_revision: int | None = None,
         runtime_instance_id: str | None = None,
         model_version: str | None = None,
-    ) -> None:
+        max_attempts_per_root_event: int | None = None,
+    ) -> bool:
         """Persist or reuse a deterministic shadow attempt without reopening terminals."""
         try:
             with self._db.session() as session:
+                if max_attempts_per_root_event is not None and getattr(self._db, "is_sqlite", False):
+                    # Serialize count+insert admission across concurrent SQLite workers.
+                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 model = session.get(ClimaxEntryAttemptModel, attempt_id)
                 if model is None:
+                    if max_attempts_per_root_event is not None:
+                        existing_count = session.scalar(
+                            select(func.count(ClimaxEntryAttemptModel.attempt_id)).where(
+                                ClimaxEntryAttemptModel.root_event_id == root_event_id
+                            )
+                        ) or 0
+                        if existing_count >= max_attempts_per_root_event:
+                            self._append_attempt_event(
+                                session,
+                                attempt_id=None,
+                                root_event_id=root_event_id,
+                                event_revision=event_revision,
+                                evaluation_id=None,
+                                event_type="attempt_limit_reached",
+                                previous_state=None,
+                                new_state=None,
+                                reason="max_attempts_per_root_event_reached",
+                                observed_at=observed_at,
+                                market_asof=None,
+                                runtime_instance_id=runtime_instance_id,
+                                model_version=model_version,
+                                details={
+                                    "existing_attempt_count": int(existing_count),
+                                    "max_attempts_per_root_event": max_attempts_per_root_event,
+                                    "requested_attempt_id": attempt_id,
+                                },
+                                idempotency_key=f"{root_event_id}:attempt-limit:{max_attempts_per_root_event}:{attempt_id}",
+                            )
+                            return False
                     model = ClimaxEntryAttemptModel(
                         attempt_id=attempt_id,
                         root_event_id=root_event_id,
@@ -647,9 +732,9 @@ class BotRepository:
                         details={},
                         idempotency_key=f"{attempt_id}:attempt_created",
                     )
-                    return
+                    return True
                 if model.attempt_closed_at is not None or model.attempt_state in _TERMINAL_ATTEMPT_STATES:
-                    return
+                    return True
                 previous_state = model.attempt_state
                 model.local_retest_high = _nullable_float(local_retest_high) or model.local_retest_high
                 model.breakdown_level = _nullable_float(breakdown_level) or model.breakdown_level
@@ -704,8 +789,10 @@ class BotRepository:
                         details={},
                         idempotency_key=f"{attempt_id}:restart:{runtime_instance_id}",
                     )
+                return True
         except Exception:
             logger.exception("shadow entry-attempt write failed root_event_id=%s attempt_id=%s", root_event_id, attempt_id)
+            return False
 
     def transition_shadow_entry_attempt(
         self,

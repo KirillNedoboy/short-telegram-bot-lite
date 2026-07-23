@@ -84,7 +84,6 @@ class AppConfig(BaseModel):
     climax_grade_a_score: int = 85
     climax_max_signal_age_minutes: int = 15
     volume_climax_unwind_enabled: bool = False
-    volume_climax_min_ret_5m_pct: float = 8.0
     volume_climax_min_ret_15m_pct: float = 12.0
     volume_climax_min_volume_ratio: float = 3.0
     volume_climax_min_volume_zscore: float = 2.5
