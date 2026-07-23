@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(ROOT.parent))
 
 from research.climax_replay import load_fixture, run_replay
 
 
-ROOT = Path(__file__).resolve().parent
 FIXTURE_PATH = ROOT / "fixtures" / "akeusdt_2026-07-15.json"
 DEFAULT_OUTPUT_DIR = ROOT / "reports"
 REPORT_STEM = "AKEUSDT_2026-07-15_climax_replay"
