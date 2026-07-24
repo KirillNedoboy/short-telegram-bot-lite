@@ -131,6 +131,9 @@ class SymbolFeatures:
     orderbook_depth_usdt_1pct: float | None = None
     orderbook_depth_usdt_2pct: float | None = None
     liquidity_available: bool = False
+    market_asof: datetime | None = None
+    last_high_time: datetime | None = None
+    last_structural_close_time: datetime | None = None
 
 
 @dataclass(slots=True)

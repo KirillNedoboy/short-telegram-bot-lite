@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -16,7 +16,7 @@ from app.features.returns import pct_return
 from app.features.rsi import rsi
 from app.features.volume import rolling_zscore
 from app.features.vwap import cumulative_vwap
-from app.market.candles import resample_ohlcv
+from app.market.candles import closed_1m_rows, complete_5m_ohlcv, normalize_utc, resample_ohlcv
 
 
 class FeatureBuilder:
@@ -29,16 +29,19 @@ class FeatureBuilder:
         state: EventState | None = None,
         derivatives: Mapping[str, Any] | None = None,
         liquidity: Mapping[str, Any] | None = None,
+        market_asof: datetime | None = None,
     ) -> SymbolFeatures:
         """Build the current feature snapshot for one symbol."""
 
         if frame_1m.empty:
             raise ValueError(f"Cannot build features for empty frame: {symbol}")
 
-        frame_5m = resample_ohlcv(frame_1m, "5min")
-        frame_15m = resample_ohlcv(frame_1m, "15min")
         latest_1m = frame_1m.iloc[-1]
-        latest_5m = frame_5m.iloc[-1]
+        market_asof = normalize_utc(market_asof or (_frame_timestamp(latest_1m["timestamp"]) + timedelta(minutes=1)))
+        closed_1m = closed_1m_rows(frame_1m, market_asof)
+        frame_5m = resample_ohlcv(frame_1m, "5min")
+        complete_5m = complete_5m_ohlcv(frame_1m, market_asof)
+        frame_15m = resample_ohlcv(frame_1m, "15min")
         latest_15m = frame_15m.iloc[-1]
 
         vwap_series = cumulative_vwap(frame_1m)
@@ -51,11 +54,16 @@ class FeatureBuilder:
         vol_zscore_30m = rolling_zscore(rolling_30m.fillna(0), window=30).iloc[-1]
         vol_zscore_1h = rolling_zscore(rolling_1h.fillna(0), window=24).iloc[-1]
 
-        candle_metrics = candle_shape(
-            float(latest_5m["open"]),
-            float(latest_5m["high"]),
-            float(latest_5m["low"]),
-            float(latest_5m["close"]),
+        latest_structural = complete_5m.iloc[-1] if not complete_5m.empty else None
+        candle_metrics = (
+            candle_shape(
+                float(latest_structural["open"]),
+                float(latest_structural["high"]),
+                float(latest_structural["low"]),
+                float(latest_structural["close"]),
+            )
+            if latest_structural is not None
+            else {"upper_wick_ratio": 0.0, "lower_wick_ratio": 0.0, "body_pct": 0.0, "rejection_from_high_pct": 0.0, "close_position_in_range": 0.0}
         )
 
         price = float(latest_1m["close"])
@@ -89,23 +97,24 @@ class FeatureBuilder:
             )
 
         recent_high_breakout = False
-        if len(frame_5m) >= 3:
-            recent_high_breakout = float(frame_5m["high"].iloc[-1]) > float(frame_5m["high"].iloc[-3:-1].max())
+        if len(complete_5m) >= 3:
+            recent_high_breakout = float(complete_5m["high"].iloc[-1]) > float(complete_5m["high"].iloc[-3:-1].max())
 
         latest_body_atr_ratio = (
-            abs(float(latest_5m["close"]) - float(latest_5m["open"])) / current_atr14
-            if current_atr14 > 0
+            abs(float(latest_structural["close"]) - float(latest_structural["open"])) / current_atr14
+            if current_atr14 > 0 and latest_structural is not None
             else 0.0
         )
         latest_failed_retest = (
             candle_metrics["upper_wick_ratio"] >= 0.12
             and candle_metrics["rejection_from_high_pct"] >= 0.5
-            and float(latest_5m["close"]) < float(latest_5m["open"])
+            and latest_structural is not None
+            and float(latest_structural["close"]) < float(latest_structural["open"])
         )
 
         return SymbolFeatures(
             symbol=symbol,
-            asof=_frame_timestamp(latest_1m["timestamp"]),
+            asof=market_asof,
             price=price,
             ret_5m=ret_5m,
             ret_15m=ret_15m,
@@ -141,15 +150,18 @@ class FeatureBuilder:
             recent_high_breakout=recent_high_breakout,
             latest_body_atr_ratio=latest_body_atr_ratio,
             latest_failed_retest=latest_failed_retest,
-            last_high=float(latest_5m["high"]),
-            last_low=float(latest_5m["low"]),
-            last_close=float(latest_5m["close"]),
+            last_high=float(closed_1m["high"].iloc[-1]) if not closed_1m.empty else 0.0,
+            last_low=float(latest_structural["low"]) if latest_structural is not None else 0.0,
+            last_close=float(latest_structural["close"]) if latest_structural is not None else 0.0,
             current_volume=float(latest_1m["volume"]),
             spread_pct=liquidity_metrics["spread_pct"],
             slippage_pct=liquidity_metrics["slippage_pct"],
             orderbook_depth_usdt_1pct=liquidity_metrics["orderbook_depth_usdt_1pct"],
             orderbook_depth_usdt_2pct=liquidity_metrics["orderbook_depth_usdt_2pct"],
             liquidity_available=liquidity_metrics["liquidity_available"],
+            market_asof=market_asof,
+            last_high_time=normalize_utc(closed_1m["timestamp"].iloc[-1]) + timedelta(minutes=1) if not closed_1m.empty else None,
+            last_structural_close_time=normalize_utc(latest_structural["timestamp"]) if latest_structural is not None else None,
         )
 
 

@@ -9,6 +9,7 @@ import pandas as pd
 
 from app.config import AppConfig
 from app.domain import EventState, EventStatus, SymbolFeatures
+from app.market.candles import closed_1m_rows
 
 
 class PumpDetector:
@@ -55,7 +56,10 @@ class PumpDetector:
             return None
 
         minutes = {"15m": 15, "1h": 60, "4h": 240}[trigger_window]
-        window = frame_1m.tail(minutes if len(frame_1m) >= minutes else len(frame_1m))
+        closed = closed_1m_rows(frame_1m, features.asof)
+        window = closed.tail(minutes if len(closed) >= minutes else len(closed))
+        if window.empty:
+            return None
         base_row = window.loc[window["low"].idxmin()]
         high_row = window.loc[window["high"].idxmax()]
         base_price = float(base_row["low"])

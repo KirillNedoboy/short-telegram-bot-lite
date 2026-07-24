@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from app.config import AppConfig
 from app.domain import EventStatus
 from app.events.pump_detector import PumpDetector
@@ -83,6 +85,92 @@ def test_pullback_tracker_expires_stale_signal_after_90_minutes(make_event_state
 
     assert config.signal_expiry_minutes == 90
     assert updated.state == EventStatus.EXPIRED
+
+
+def test_pullback_tracker_resets_stale_pullback_after_confirmed_new_high(make_event_state, make_features) -> None:
+    tracker = PullbackTracker(AppConfig())
+    confirmed_at = datetime(2026, 7, 24, 12, 5, tzinfo=timezone.utc)
+    state = make_event_state(
+        state=EventStatus.SHORT_ZONE_ACTIVE,
+        pullback_detected_at=confirmed_at,
+        pullback_depth_pct=4.0,
+        pullback_low_price=109.0,
+        zone_low=110.0,
+        zone_high=113.0,
+        expires_at=confirmed_at + timedelta(hours=1),
+    )
+    original_event_id = state.event_id
+    features = make_features(last_high=116.0, last_high_time=confirmed_at, price=112.0)
+
+    reset = tracker.reset_after_confirmed_high(state, features, confirmed_at)
+
+    assert reset is True
+    assert state.event_id == original_event_id
+    assert state.state == EventStatus.PUMP_DETECTED
+    assert state.event_high == 116.0
+    assert state.event_high_time == confirmed_at
+    assert state.pullback_detected_at is None
+    assert state.pullback_depth_pct is None
+    assert state.pullback_low_price is None
+    assert state.zone_low is None
+    assert state.zone_high is None
+
+
+def test_pullback_tracker_keeps_active_pullback_when_high_is_not_confirmed(make_event_state, make_features) -> None:
+    tracker = PullbackTracker(AppConfig())
+    state = make_event_state(
+        state=EventStatus.PULLBACK_OBSERVED,
+        pullback_detected_at=make_features().asof,
+        pullback_depth_pct=3.0,
+        pullback_low_price=111.0,
+        zone_low=110.0,
+        zone_high=113.0,
+    )
+    features = make_features(last_high=115.0, last_high_time=None)
+
+    reset = tracker.reset_after_confirmed_high(state, features, features.asof)
+
+    assert reset is False
+    assert state.state == EventStatus.PULLBACK_OBSERVED
+    assert state.zone_low == 110.0
+
+
+def test_pullback_tracker_requires_a_new_pullback_after_confirmed_high_reset(make_event_state, make_features) -> None:
+    tracker = PullbackTracker(AppConfig())
+    confirmed_at = datetime(2026, 7, 24, 12, 5, tzinfo=timezone.utc)
+    state = make_event_state(
+        state=EventStatus.SHORT_ZONE_ACTIVE,
+        pullback_detected_at=confirmed_at,
+        pullback_depth_pct=4.0,
+        pullback_low_price=109.0,
+        zone_low=110.0,
+        zone_high=113.0,
+        expires_at=confirmed_at + timedelta(hours=1),
+    )
+    reset_features = make_features(last_high=116.0, last_high_time=confirmed_at, price=114.0)
+    tracker.reset_after_confirmed_high(state, reset_features, confirmed_at)
+
+    shallow = make_features(last_high=116.0, last_high_time=confirmed_at, price=114.0, last_low=113.5)
+    after_shallow = tracker.advance(state, shallow, confirmed_at + timedelta(minutes=1))
+    assert after_shallow.state == EventStatus.PUMP_DETECTED
+    assert after_shallow.pullback_detected_at is None
+
+    deep = make_features(last_high=116.0, last_high_time=confirmed_at, price=112.0, last_low=111.0)
+    after_deep = tracker.advance(after_shallow, deep, confirmed_at + timedelta(minutes=2))
+
+    assert after_deep.state == EventStatus.PULLBACK_OBSERVED
+    assert after_deep.pullback_detected_at == confirmed_at + timedelta(minutes=2)
+
+
+def test_pullback_tracker_interprets_naive_sqlite_expiry_as_utc(make_event_state, make_features) -> None:
+    tracker = PullbackTracker(AppConfig())
+    now = datetime(2026, 7, 24, 12, 5, tzinfo=timezone.utc)
+    state = make_event_state(expires_at=datetime(2026, 7, 24, 12, 5))
+
+    updated = tracker.advance(state, make_features(asof=now), now)
+
+    assert updated.state == EventStatus.EXPIRED
+    assert updated.expires_at == now
 
 
 def test_pump_detector_uses_or_trigger_for_event_windows(make_features) -> None:

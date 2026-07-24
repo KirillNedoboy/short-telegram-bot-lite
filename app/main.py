@@ -630,15 +630,24 @@ class ShortSignalBot:
         features: SymbolFeatures | None = None,
         fast_monitor: bool = False,
         poll_sequence: int | None = None,
+        market_asof: datetime | None = None,
     ) -> SignalDecision | None:
         """Evaluate, dedupe, persist, and deliver one climax signal."""
         if not self._config.climax_short_enabled or state.signal_id is not None:
             return None
         if features is None:
+            market_asof = market_asof or datetime.now(timezone.utc)
             derivatives = await self._scanner.fetch_optional_derivatives(symbol)
             liquidity = await self._fetch_optional_liquidity(symbol, float(frame_1m["close"].iloc[-1]))
-            features = self._feature_builder.build(symbol, frame_1m, state=state, derivatives=derivatives, liquidity=liquidity)
-        bundle = evaluate_climax_bundle(state, features, frame_1m, self._config)
+            features = self._feature_builder.build(
+                symbol,
+                frame_1m,
+                state=state,
+                derivatives=derivatives,
+                liquidity=liquidity,
+                market_asof=market_asof,
+            )
+        bundle = evaluate_climax_bundle(state, features, frame_1m, self._config, strict_closed_candles=True)
         evaluation: ClimaxEvaluation = bundle.selected
         shadow_evaluation: ClimaxEvaluation | None = None
         if self._config.low_volume_frozen_initial_extension_enabled and self._config.low_volume_frozen_initial_extension_shadow_only:
@@ -978,8 +987,22 @@ class ShortSignalBot:
                 if fresh_frame is not None and not fresh_frame.empty:
                     fresh_derivatives = await self._scanner.fetch_optional_derivatives(symbol)
                     fresh_liquidity = await self._fetch_optional_liquidity(symbol, float(fresh_frame["close"].iloc[-1]))
-                    fresh_features = self._feature_builder.build(symbol, fresh_frame, state=state, derivatives=fresh_derivatives, liquidity=fresh_liquidity)
-                    fresh_bundle = evaluate_climax_bundle(state, fresh_features, fresh_frame, self._config)
+                    recheck_market_asof = datetime.now(timezone.utc)
+                    fresh_features = self._feature_builder.build(
+                        symbol,
+                        fresh_frame,
+                        state=state,
+                        derivatives=fresh_derivatives,
+                        liquidity=fresh_liquidity,
+                        market_asof=recheck_market_asof,
+                    )
+                    fresh_bundle = evaluate_climax_bundle(
+                        state,
+                        fresh_features,
+                        fresh_frame,
+                        self._config,
+                        strict_closed_candles=True,
+                    )
                     fresh_eval = fresh_bundle.selected
                     fresh_evaluation_id = self._repository.record_climax_evaluation(
                         evaluation_time=datetime.now(timezone.utc),
@@ -1189,8 +1212,15 @@ class ShortSignalBot:
         frame_1m: pd.DataFrame,
         state: EventState | None,
     ) -> tuple[SignalDecision | None, EventState | None]:
+        market_asof = datetime.now(timezone.utc)
         derivatives = await self._scanner.fetch_optional_derivatives(symbol)
-        features = self._feature_builder.build(symbol, frame_1m, state=state, derivatives=derivatives)
+        features = self._feature_builder.build(
+            symbol,
+            frame_1m,
+            state=state,
+            derivatives=derivatives,
+            market_asof=market_asof,
+        )
         now = features.asof
 
         if state is None or state.state in {EventStatus.IDLE, EventStatus.EXPIRED}:
@@ -1200,30 +1230,34 @@ class ShortSignalBot:
             if self._config.climax_short_enabled:
                 self._track_climax_candidate(new_state, now)
                 liquidity = await self._fetch_optional_liquidity(symbol, features.price)
-                features = self._feature_builder.build(symbol, frame_1m, state=new_state, derivatives=derivatives, liquidity=liquidity)
+                features = self._feature_builder.build(
+                    symbol,
+                    frame_1m,
+                    state=new_state,
+                    derivatives=derivatives,
+                    liquidity=liquidity,
+                    market_asof=market_asof,
+                )
                 climax_decision = await self._evaluate_and_send_climax(symbol, frame_1m, new_state, features=features)
                 if climax_decision is not None:
                     return climax_decision, new_state
             early_watch = await self._maybe_emit_early_pump_watch(new_state, features, now)
             return early_watch, new_state
 
-        replacement_event = self._pump_detector.build_event(symbol, frame_1m, features, now)
-        if (
-            replacement_event is not None
-            and state.signal_id is None
-            and state.event_high is not None
-            and features.last_high > state.event_high
-        ):
-            state = replacement_event
-            if self._config.climax_short_enabled:
-                self._track_climax_candidate(state, now)
-            early_watch = await self._maybe_emit_early_pump_watch(state, features, now)
-            return early_watch, state
+        if self._pullback_tracker.reset_after_confirmed_high(state, features, now):
+            return None, state
 
         if self._config.climax_short_enabled:
             self._track_climax_candidate(state, now)
             liquidity = await self._fetch_optional_liquidity(symbol, features.price)
-            features = self._feature_builder.build(symbol, frame_1m, state=state, derivatives=derivatives, liquidity=liquidity)
+            features = self._feature_builder.build(
+                symbol,
+                frame_1m,
+                state=state,
+                derivatives=derivatives,
+                liquidity=liquidity,
+                market_asof=market_asof,
+            )
             climax_decision = await self._evaluate_and_send_climax(symbol, frame_1m, state, features=features)
             if climax_decision is not None:
                 return climax_decision, state
@@ -1237,6 +1271,8 @@ class ShortSignalBot:
         state = self._pullback_tracker.advance(state, features, now)
         if state.state == EventStatus.EXPIRED:
             return None, state
+        if state.state == EventStatus.PUMP_DETECTED:
+            return await self._maybe_emit_early_pump_watch(state, features, now), state
 
         zone = self._zone_builder.build(state, features)
         if zone is None:
@@ -1251,6 +1287,7 @@ class ShortSignalBot:
             state=state,
             derivatives=derivatives,
             liquidity=liquidity,
+            market_asof=market_asof,
         )
 
         if zone.low <= features.price <= zone.high and state.state == EventStatus.PULLBACK_OBSERVED:
@@ -1401,17 +1438,9 @@ class ShortSignalBot:
         return await fetcher(symbol, price)
 
     def _should_cancel_after_high_break(self, state: EventState, features: SymbolFeatures, now: datetime) -> bool:
-        if state.event_high is None or features.last_high <= state.event_high:
-            return False
-        if state.event_high_time and now >= state.event_high_time + timedelta(minutes=self._config.max_signal_age_minutes):
-            return True
-        if self._config.cancel_on_new_event_high and state.state == EventStatus.SHORT_ZONE_ACTIVE:
-            return True
-        return (
-            self._config.cancel_on_volume_breakout
-            and state.state in {EventStatus.PULLBACK_OBSERVED, EventStatus.SHORT_ZONE_ACTIVE}
-            and features.vol_zscore_30m >= self._config.vol_zscore_min
-        )
+        """Retain the compatibility hook; confirmed highs reset before baseline evaluation."""
+
+        return False
 
     async def _handle_error(self, key: str, exc: Exception) -> None:
         self._health.on_error()

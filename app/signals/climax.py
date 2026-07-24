@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import pandas as pd
 
 from app.domain import EventState, SymbolFeatures
+from app.market.candles import complete_5m_ohlcv, normalize_utc
 
 
 @dataclass(slots=True)
@@ -261,20 +262,38 @@ def _common_metadata(
     distance = ((high - features.price) / high * 100) if high else None
     rejection = float(features.rejection_from_high_pct)
     breakout_reference = previous_high * (1.0 - 0.005)
-    data_after_high = latest_closed.loc[timestamps.loc[latest_closed.index] > pd.Timestamp(state.event_high_time).tz_convert("UTC")] if state.event_high_time else latest_closed.iloc[0:0]
+    event_high_time = pd.Timestamp(normalize_utc(state.event_high_time)) if state.event_high_time else None
+    data_after_high = latest_closed.loc[timestamps.loc[latest_closed.index] > event_high_time] if event_high_time is not None else latest_closed.iloc[0:0]
     post_high_high = float(data_after_high["high"].max()) if not data_after_high.empty else None
-    if state.event_high_time:
-        confirmation_end = pd.Timestamp(state.event_high_time).tz_convert("UTC") + pd.Timedelta(minutes=confirmation_window_minutes)
+    if event_high_time is not None:
+        confirmation_end = event_high_time + timedelta(minutes=confirmation_window_minutes)
         confirmation_window = data_after_high.loc[timestamps.loc[data_after_high.index] <= confirmation_end]
     else:
         confirmation_window = data_after_high.iloc[0:0]
-    post_high_closes = confirmation_window["close"].tolist() if "close" in confirmation_window else []
     post_high_count = len(confirmation_window)
-    retest_window = data_after_high.loc[timestamps.loc[data_after_high.index] > confirmation_end] if state.event_high_time else data_after_high.iloc[0:0]
+    structural = complete_5m_ohlcv(frame, features.asof) if strict_closed_candles else latest_closed
+    structural_timestamps = (
+        pd.Series(pd.to_datetime(structural["timestamp"], utc=True, errors="coerce"), index=structural.index)
+        if not structural.empty
+        else pd.Series(dtype="datetime64[ns, UTC]")
+    )
+    structural_after_high = structural.loc[structural_timestamps > event_high_time] if event_high_time is not None else structural.iloc[0:0]
+    if event_high_time is not None:
+        structural_confirmation = structural_after_high.loc[
+            structural_timestamps.loc[structural_after_high.index] <= confirmation_end
+        ]
+        retest_window = structural_after_high.loc[
+            structural_timestamps.loc[structural_after_high.index] > confirmation_end
+        ]
+    else:
+        structural_confirmation = structural_after_high.iloc[0:0]
+        retest_window = structural_after_high.iloc[0:0]
+    post_high_closes = structural_confirmation["close"].tolist() if "close" in structural_confirmation else []
+    post_high_high = float(structural_after_high["high"].max()) if not structural_after_high.empty else None
     post_high_retest_high = float(retest_window["high"].max()) if not retest_window.empty else None
     local_prior = latest_closed.iloc[-8:-5] if len(latest_closed) >= 8 else latest_closed.iloc[:-5]
     local_swing_low = float(local_prior["low"].min()) if not local_prior.empty else None
-    current_close = float(latest_closed["close"].iloc[-1]) if not latest_closed.empty else features.price
+    current_close = float(structural["close"].iloc[-1]) if not structural.empty else features.price
     return {
         "strategy_type": "CLIMAX_EXHAUSTION",
         "model_version": "climax-v1",

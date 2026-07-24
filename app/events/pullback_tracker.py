@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 from app.config import AppConfig
 from app.domain import EventState, EventStatus, SymbolFeatures
+from app.market.candles import normalize_utc
 
 
 class PullbackTracker:
@@ -17,6 +18,11 @@ class PullbackTracker:
     def advance(self, state: EventState, features: SymbolFeatures, now: datetime) -> EventState:
         """Update a tracked event with current market context."""
 
+        now = normalize_utc(now)
+        if state.expires_at is not None:
+            state.expires_at = normalize_utc(state.expires_at)
+        if state.signal_sent_at is not None:
+            state.signal_sent_at = normalize_utc(state.signal_sent_at)
         state.updated_at = now
         if self._should_expire(state, features, now):
             state.state = EventStatus.EXPIRED
@@ -31,10 +37,8 @@ class PullbackTracker:
         if state.event_high is None or state.event_base_price is None:
             return state
 
-        if state.pullback_detected_at is None and features.last_high > state.event_high:
-            state.event_high = features.last_high
-            state.event_high_time = now
-            state.event_range_pct = ((state.event_high / state.event_base_price) - 1) * 100
+        if self.reset_after_confirmed_high(state, features, now):
+            return state
 
         pullback_pct = ((state.event_high - features.price) / state.event_high) * 100 if state.event_high else 0.0
         state.pullback_depth_pct = max(state.pullback_depth_pct or 0.0, pullback_pct)
@@ -59,6 +63,30 @@ class PullbackTracker:
             state.pullback_low_price = features.last_low
 
         return state
+
+    def reset_after_confirmed_high(self, state: EventState, features: SymbolFeatures, now: datetime) -> bool:
+        """Reset stale baseline pullback state after a confirmed 1m event high."""
+
+        if (
+            state.signal_id is not None
+            or state.event_high is None
+            or state.event_base_price is None
+            or features.last_high_time is None
+            or features.last_high <= state.event_high
+        ):
+            return False
+        confirmed_at = normalize_utc(features.last_high_time)
+        state.event_high = features.last_high
+        state.event_high_time = confirmed_at
+        state.event_range_pct = ((state.event_high / state.event_base_price) - 1) * 100
+        state.pullback_detected_at = None
+        state.pullback_depth_pct = None
+        state.pullback_low_price = None
+        state.zone_low = None
+        state.zone_high = None
+        state.state = EventStatus.PUMP_DETECTED
+        state.updated_at = normalize_utc(now)
+        return True
 
     def mark_signal_sent(self, state: EventState, signal_id: int, when: datetime) -> EventState:
         """Mark the current event as already signaled."""

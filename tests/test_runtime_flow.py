@@ -620,6 +620,7 @@ def test_early_pump_watch_is_deduped_for_same_event_id_across_cycles(
             latest_failed_retest=False,
             liquidity_available=False,
             last_high=120.0,
+            price=114.0,
         )
         state = make_event_state(
             symbol="EPICUSDT",
@@ -737,7 +738,7 @@ def test_run_cycle_preserves_shortlist_rank_order_and_appends_missing_active_sym
     assert requested_symbols == ["CCCUSDT", "AAAUSDT", "BBBUSDT", "ZZZUSDT"]
 
 
-def test_new_high_after_short_zone_cancels_signal(
+def test_confirmed_new_high_after_short_zone_resets_without_delivery(
     tmp_path,
     make_event_state,
     make_features,
@@ -759,22 +760,37 @@ def test_new_high_after_short_zone_cancels_signal(
             zone_high=113.8,
             pullback_detected_at=make_features().asof - timedelta(minutes=5),
         )
-        features = make_features(last_high=116.0, price=112.0, inside_short_zone_flag=True)
+        features = make_features(
+            last_high=116.0,
+            last_high_time=make_features().asof,
+            price=112.0,
+            inside_short_zone_flag=True,
+        )
 
         bot._pump_detector.build_event = lambda *_args, **_kwargs: None
         bot._feature_builder.build = lambda *_args, **_kwargs: features
 
-        return await bot._process_symbol("ONTUSDT", object(), state), notifier
+        result = await bot._process_symbol("ONTUSDT", object(), state)
+        with database.session() as session:
+            signal_count = len(session.scalars(select(SignalModel)).all())
+            outbox_count = len(session.scalars(select(TelegramDeliveryOutboxModel)).all())
+        return result, notifier, signal_count, outbox_count
 
-    (decision, updated_state), notifier = asyncio.run(_run())
+    (decision, updated_state), notifier, signal_count, outbox_count = asyncio.run(_run())
 
     assert decision is None
     assert updated_state is not None
-    assert updated_state.state == EventStatus.EXPIRED
+    assert updated_state.state == EventStatus.PUMP_DETECTED
+    assert updated_state.event_high == 116.0
+    assert updated_state.pullback_detected_at is None
+    assert updated_state.zone_low is None
+    assert updated_state.zone_high is None
     assert notifier.messages == []
+    assert signal_count == 0
+    assert outbox_count == 0
 
 
-def test_volume_breakout_above_event_high_cancels_signal(
+def test_unconfirmed_new_high_does_not_reset_active_pullback(
     tmp_path,
     make_event_state,
     make_features,
@@ -798,8 +814,9 @@ def test_volume_breakout_above_event_high_cancels_signal(
         )
         features = make_features(
             last_high=116.0,
-            price=112.0,
-            inside_short_zone_flag=True,
+            last_high_time=None,
+            price=114.0,
+            inside_short_zone_flag=False,
             vol_zscore_30m=3.0,
         )
 
@@ -812,7 +829,8 @@ def test_volume_breakout_above_event_high_cancels_signal(
 
     assert decision is None
     assert updated_state is not None
-    assert updated_state.state == EventStatus.EXPIRED
+    assert updated_state.state == EventStatus.PULLBACK_OBSERVED
+    assert updated_state.event_high == 115.0
     assert notifier.messages == []
 
 
