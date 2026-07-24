@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 
-import pytest
+import numpy as np
 
 from app.observability.strategy_observations import (
     ObservationWriteStatus,
@@ -15,12 +16,12 @@ from app.storage.db import Database
 from app.storage.repository import BotRepository
 
 
-def _observation(*, runtime_instance_id: str = "runtime-1") -> StrategyObservation:
+def _observation(*, runtime_instance_id: str = "runtime-1", strategy: str = "VOLUME_CLIMAX_UNWIND") -> StrategyObservation:
     observed_at = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
     evidence = build_observation_evidence({"ret_5m": 3.0, "reason": "oi_missing"})
     key = make_observation_idempotency_key(
         strategy_family="CLIMAX_EXHAUSTION",
-        strategy="VOLUME_CLIMAX_UNWIND",
+        strategy=strategy,
         symbol="TESTUSDT",
         root_event_id="root-1",
         event_revision=1,
@@ -36,7 +37,7 @@ def _observation(*, runtime_instance_id: str = "runtime-1") -> StrategyObservati
         run_id="run-1",
         runtime_instance_id=runtime_instance_id,
         strategy_family="CLIMAX_EXHAUSTION",
-        strategy="VOLUME_CLIMAX_UNWIND",
+        strategy=strategy,
         evaluation_phase="INITIAL",
         symbol="TESTUSDT",
         root_event_id="root-1",
@@ -78,14 +79,97 @@ def test_same_observation_is_duplicate_across_runtime_restarts(tmp_path) -> None
         assert connection.exec_driver_sql("pragma integrity_check").scalar_one() == "ok"
 
 
-def test_evidence_is_deterministic_bounded_and_rejects_nonfinite_values() -> None:
+def test_both_climax_branches_are_saved_for_one_root_event(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'strategy-branches.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+
+    volume = repository.record_strategy_observation(_observation(strategy="VOLUME_CLIMAX_UNWIND"))
+    low_volume = repository.record_strategy_observation(
+        replace(_observation(strategy="LOW_VOLUME_EXTENSION_FAILURE"), observation_id="observation-2")
+    )
+
+    assert volume.status is ObservationWriteStatus.INSERTED
+    assert low_volume.status is ObservationWriteStatus.INSERTED
+    with database.engine.connect() as connection:
+        rows = connection.exec_driver_sql(
+            "select strategy from strategy_observations order by strategy"
+        ).scalars().all()
+    assert rows == ["LOW_VOLUME_EXTENSION_FAILURE", "VOLUME_CLIMAX_UNWIND"]
+
+
+def test_nested_nonfinite_values_are_saved_as_null_with_exact_paths() -> None:
+    evidence = build_observation_evidence(
+        {
+            "features": {
+                "oi_change_pct": float("nan"),
+                "levels": [float("inf"), {"floor": float("-inf")}],
+                "finite": 1.25,
+            }
+        }
+    )
+
+    assert evidence.snapshot["features"] == {
+        "finite": 1.25,
+        "levels": [None, {"floor": None}],
+        "oi_change_pct": None,
+    }
+    assert evidence.snapshot["evidence_warnings"] == [
+        {"path": "features.levels[0]", "reason": "NON_FINITE_FLOAT", "original": "+Inf"},
+        {"path": "features.levels[1].floor", "reason": "NON_FINITE_FLOAT", "original": "-Inf"},
+        {"path": "features.oi_change_pct", "reason": "NON_FINITE_FLOAT", "original": "NaN"},
+    ]
+    assert evidence.warnings == evidence.snapshot["evidence_warnings"]
+
+
+def test_numpy_nonfinite_values_are_saved_as_null() -> None:
+    evidence = build_observation_evidence({"features": {"ratio": np.float32(np.nan)}})
+
+    assert evidence.snapshot["features"]["ratio"] is None
+    assert evidence.warnings[0]["path"] == "features.ratio"
+    assert evidence.warnings[0]["original"] == "NaN"
+
+
+def test_nonfinite_observation_is_persisted_with_warning_payload(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'sanitized-observation.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    evidence = build_observation_evidence({"features": {"oi_change_pct": float("nan")}})
+    observation = replace(
+        _observation(),
+        input_fingerprint=evidence.input_fingerprint,
+        input_snapshot=evidence.snapshot,
+    )
+
+    result = repository.record_strategy_observation(observation)
+
+    assert result.status is ObservationWriteStatus.INSERTED
+    with database.engine.connect() as connection:
+        snapshot_json = connection.exec_driver_sql(
+            "select input_snapshot_json from strategy_observations"
+        ).scalar_one()
+    snapshot = json.loads(snapshot_json)
+    assert snapshot["features"]["oi_change_pct"] is None
+    assert snapshot["evidence_warnings"][0]["path"] == "features.oi_change_pct"
+
+
+def test_finite_snapshot_is_unchanged_and_fingerprint_is_deterministic() -> None:
+    first = build_observation_evidence({"features": {"price": 1.25}, "finite": True})
+    second = build_observation_evidence({"finite": True, "features": {"price": 1.25}})
+
+    assert first.snapshot == {"features": {"price": 1.25}, "finite": True}
+    assert first.warnings == []
+    assert first.input_fingerprint == second.input_fingerprint
+    assert first.snapshot_json == second.snapshot_json
+
+
+def test_evidence_is_deterministic_and_bounded() -> None:
     evidence = build_observation_evidence({"when": datetime(2026, 7, 24, 15, tzinfo=timezone.utc), "payload": "x" * 40_000})
 
     assert evidence.snapshot["snapshot_truncated"] is True
     assert evidence.snapshot["full_input_fingerprint"] == evidence.input_fingerprint
     assert len(evidence.snapshot_json.encode("utf-8")) <= 32 * 1024
-    with pytest.raises(ValueError, match="non-finite"):
-        build_observation_evidence({"price": float("nan")})
+    assert evidence.warnings == []
 
 
 def test_strategy_observation_schema_has_research_query_indexes(tmp_path) -> None:

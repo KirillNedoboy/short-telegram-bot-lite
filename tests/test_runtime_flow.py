@@ -110,6 +110,29 @@ def test_notifier_failure_leaves_signal_retryable_in_outbox(tmp_path, make_event
     assert state[1:] == ("RETRY", 1, "RuntimeError: telegram transport down")
 
 
+def test_strategy_observation_failure_alert_is_deduplicated_per_root_event(tmp_path) -> None:
+    async def _run() -> list[str]:
+        database = Database(f"sqlite:///{tmp_path / 'observation-alert-dedupe.db'}")
+        database.create_all()
+        notifier = _FakeNotifier()
+        bot = ShortSignalBot(
+            config=AppConfig(error_alert_ttl_sec=3600),
+            repository=BotRepository(database),
+            scanner=_FakeScanner(),
+            notifier=notifier,
+        )
+        failed = [ObservationWriteResult(ObservationWriteStatus.FAILED)]
+        await bot._report_strategy_observation_failures(failed, root_event_id="root-1")
+        await bot._report_strategy_observation_failures(failed, root_event_id="root-1")
+        await bot._report_strategy_observation_failures(failed, root_event_id="root-2")
+        return notifier.messages
+
+    assert asyncio.run(_run()) == [
+        "Strategy observation ledger write failed; scanner delivery continues.",
+        "Strategy observation ledger write failed; scanner delivery continues.",
+    ]
+
+
 def test_disabled_watch_delivery_is_not_drained(tmp_path, make_event_state, make_signal_decision) -> None:
     async def _run() -> tuple[list[str], str]:
         database = Database(f"sqlite:///{tmp_path / 'watch-drain.db'}")
@@ -418,7 +441,8 @@ def test_failed_observation_write_alerts_without_changing_signal_delivery(
     assert signal_count == 1
     assert outbox_count == 1
     assert messages[0] == "Strategy observation ledger write failed; scanner delivery continues."
-    assert len(messages) == 2
+    assert len(messages) == 3
+    assert sum(message == "Strategy observation ledger write failed; scanner delivery continues." for message in messages) == 2
     assert failure_count == 2
 
 

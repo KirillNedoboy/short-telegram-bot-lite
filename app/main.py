@@ -880,7 +880,7 @@ class ShortSignalBot:
             lifecycle_shadow=lifecycle_shadow,
             observed_at=evaluated_at,
         )
-        await self._report_strategy_observation_failures(observation_results)
+        await self._report_strategy_observation_failures(observation_results, root_event_id=root_event_id)
         if evaluation.metadata.get("volume_climax_observed"):
             volume_metadata = dict(evaluation.metadata.get("volume_climax_metadata") or {})
             volume_candidate = bool(evaluation.metadata.get("volume_climax_candidate"))
@@ -1059,7 +1059,7 @@ class ShortSignalBot:
                         lifecycle_shadow=lifecycle_shadow,
                         observed_at=datetime.now(timezone.utc),
                     )
-                    await self._report_strategy_observation_failures(observation_results)
+                    await self._report_strategy_observation_failures(observation_results, root_event_id=root_event_id)
                     if not fresh_eval.actionable or fresh_eval.subtype != "LOW_VOLUME_EXTENSION_FAILURE":
                         self._logger.info("Climax delivery veto: fresh_admission_failed symbol=%s reasons=%s", symbol, fresh_eval.veto_reasons)
                         return None
@@ -1122,6 +1122,14 @@ class ShortSignalBot:
                     "features": asdict(features),
                 }
                 evidence = build_observation_evidence(snapshot)
+                if evidence.warnings:
+                    self._logger.warning(
+                        "strategy observation evidence sanitized strategy=%s symbol=%s field_paths=%s non_finite_count=%s",
+                        strategy,
+                        features.symbol,
+                        [warning["path"] for warning in evidence.warnings],
+                        len(evidence.warnings),
+                    )
                 model_version = str(branch_evaluation.metadata.get("model_version", "climax-v1"))
                 idempotency_key = make_observation_idempotency_key(
                     strategy_family="CLIMAX_EXHAUSTION",
@@ -1194,12 +1202,22 @@ class ShortSignalBot:
             return state
         return "REJECTED"
 
-    async def _report_strategy_observation_failures(self, results: list[ObservationWriteResult]) -> None:
+    async def _report_strategy_observation_failures(
+        self,
+        results: list[ObservationWriteResult],
+        *,
+        root_event_id: str | None = None,
+    ) -> None:
         failures = [result for result in results if result.status is ObservationWriteStatus.FAILED]
         if not failures:
             return
         self._health.on_strategy_observation_write_failure(len(failures))
-        if not self._error_throttler.should_send("strategy_observation_ledger_write_failed"):
+        alert_key = (
+            f"strategy_observation_ledger_write_failed:{root_event_id}"
+            if root_event_id
+            else "strategy_observation_ledger_write_failed"
+        )
+        if not self._error_throttler.should_send(alert_key):
             return
         try:
             await self._notifier.send_alert("Strategy observation ledger write failed; scanner delivery continues.")

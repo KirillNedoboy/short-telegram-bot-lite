@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Mapping
 
+import numpy as np
+
 
 MAX_SNAPSHOT_BYTES = 32 * 1024
 _SENSITIVE_KEY_PARTS = ("token", "secret", "password", "chat_id", "db_url", "database_url", "logging")
@@ -26,6 +28,7 @@ class ObservationEvidence:
     input_fingerprint: str
     snapshot: dict[str, Any]
     snapshot_json: str
+    warnings: list[dict[str, str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,19 +71,24 @@ class ObservationWriteResult:
 def build_observation_evidence(snapshot: Mapping[str, Any], *, max_bytes: int = MAX_SNAPSHOT_BYTES) -> ObservationEvidence:
     """Build bounded, canonical, non-secret evidence for one observation."""
 
-    canonical_value = _canonicalize(snapshot)
+    canonical_value, warnings = _canonicalize(snapshot)
+    if not isinstance(canonical_value, dict):
+        raise TypeError("observation evidence root must be a mapping")
+    if warnings:
+        canonical_value["evidence_warnings"] = warnings
     canonical_json = json.dumps(canonical_value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     fingerprint = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
     if len(canonical_json.encode("utf-8")) <= max_bytes:
-        return ObservationEvidence(fingerprint, canonical_value, canonical_json)
+        return ObservationEvidence(fingerprint, canonical_value, canonical_json, warnings)
     keys = sorted(canonical_value)[:128] if isinstance(canonical_value, dict) else []
     bounded = {
         "snapshot_truncated": True,
         "full_input_fingerprint": fingerprint,
         "omitted_top_level_keys": keys,
+        "evidence_warnings": warnings,
     }
     bounded_json = json.dumps(bounded, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return ObservationEvidence(fingerprint, bounded, bounded_json)
+    return ObservationEvidence(fingerprint, bounded, bounded_json, warnings)
 
 
 def make_observation_idempotency_key(
@@ -115,24 +123,48 @@ def make_observation_idempotency_key(
 
 
 def _fingerprint(value: Mapping[str, Any]) -> str:
-    canonical_json = json.dumps(_canonicalize(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    canonical_value, warnings = _canonicalize(value)
+    if warnings:
+        canonical_value["evidence_warnings"] = warnings
+    canonical_json = json.dumps(canonical_value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
-def _canonicalize(value: Any, *, key: str | None = None) -> Any:
+def _canonicalize(value: Any, *, key: str | None = None, path: str = "") -> tuple[Any, list[dict[str, str]]]:
     if key is not None and any(part in key.lower() for part in _SENSITIVE_KEY_PARTS):
-        return "[excluded]"
+        return "[excluded]", []
     if isinstance(value, Mapping):
-        return {str(item_key): _canonicalize(item_value, key=str(item_key)) for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))}
+        mapping_result: dict[str, Any] = {}
+        mapping_warnings: list[dict[str, str]] = []
+        for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0])):
+            item_key_str = str(item_key)
+            item_path = f"{path}.{item_key_str}" if path else item_key_str
+            normalized, item_warnings = _canonicalize(item_value, key=item_key_str, path=item_path)
+            mapping_result[item_key_str] = normalized
+            mapping_warnings.extend(item_warnings)
+        return mapping_result, mapping_warnings
     if isinstance(value, (list, tuple)):
-        return [_canonicalize(item) for item in value]
+        list_result: list[Any] = []
+        list_warnings: list[dict[str, str]] = []
+        for index, item in enumerate(value):
+            normalized, item_warnings = _canonicalize(item, path=f"{path}[{index}]")
+            list_result.append(normalized)
+            list_warnings.extend(item_warnings)
+        return list_result, list_warnings
     if isinstance(value, datetime):
         timestamp = value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
-        return timestamp.isoformat().replace("+00:00", "Z")
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("non-finite float is not valid observation evidence")
-        return float(format(value, ".15g"))
+        return timestamp.isoformat().replace("+00:00", "Z"), []
+    if isinstance(value, (float, np.floating)):
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value):
+            if math.isnan(numeric_value):
+                original = "NaN"
+            elif numeric_value > 0:
+                original = "+Inf"
+            else:
+                original = "-Inf"
+            return None, [{"path": path or "$", "reason": "NON_FINITE_FLOAT", "original": original}]
+        return float(format(numeric_value, ".15g")), []
     if isinstance(value, (str, int, bool)) or value is None:
-        return value
+        return value, []
     raise TypeError(f"unsupported observation evidence value: {type(value).__name__}")
