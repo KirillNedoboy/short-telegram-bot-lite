@@ -203,6 +203,59 @@ def test_process_symbol_persists_signal_and_suppresses_duplicates(
     assert len(notifier.messages) == 1
 
 
+def test_process_symbol_resets_old_setup_on_confirmed_new_high_without_signal(
+    tmp_path,
+    make_event_state,
+    make_features,
+) -> None:
+    async def _run():
+        database = Database(f"sqlite:///{tmp_path / 'new-high-reset.db'}")
+        database.create_all()
+        repository = BotRepository(database)
+        notifier = _FakeNotifier()
+        bot = ShortSignalBot(
+            config=AppConfig(),
+            repository=repository,
+            scanner=_FakeScanner(),
+            notifier=notifier,
+        )
+        state = repository.upsert_event_state(
+            make_event_state(
+                state=EventStatus.SHORT_ZONE_ACTIVE,
+                pullback_detected_at=datetime(2026, 4, 13, 12, 0, tzinfo=timezone.utc),
+                pullback_depth_pct=4.0,
+                zone_low=110.0,
+                zone_high=113.0,
+            )
+        )
+        features = make_features(
+            asof=state.updated_at,
+            last_high=116.0,
+            last_high_time=state.updated_at,
+            price=112.0,
+        )
+        bot._pump_detector.build_event = lambda *_args, **_kwargs: None
+        bot._feature_builder.build = lambda *_args, **_kwargs: features
+
+        decision, updated_state = await bot._process_symbol("ONTUSDT", object(), state)
+        return decision, updated_state, notifier, database
+
+    decision, state, notifier, database = asyncio.run(_run())
+
+    assert decision is None
+    assert state is not None
+    assert state.event_id == "ONTUSDT:15m:1:111"
+    assert state.event_high == 116.0
+    assert state.state == EventStatus.PUMP_DETECTED
+    assert state.pullback_detected_at is None
+    assert state.zone_low is None
+    assert state.zone_high is None
+    assert state.signal_id is None
+    assert notifier.messages == []
+    with database.session() as session:
+        assert session.scalars(select(SignalModel)).all() == []
+
+
 def test_disabled_baseline_delivery_gate_has_no_signal_side_effects(
     tmp_path,
     make_event_state,

@@ -40,14 +40,28 @@ def test_feature_builder_keeps_partial_5m_structure_out_of_rejection_and_breakou
     partial = builder.build("TESTUSDT", frame, market_asof=start + timedelta(minutes=14, seconds=30))
     complete = builder.build("TESTUSDT", frame, market_asof=start + timedelta(minutes=15))
 
-    assert partial.last_high == float(frame["high"].iloc[-2])
-    assert partial.last_high_time == start + timedelta(minutes=14)
+    assert partial.last_high == float(frame["high"].iloc[:14].max())
+    assert partial.last_high_time == start + timedelta(minutes=13)
     assert partial.recent_high_breakout is False
     assert partial.latest_failed_retest is False
     assert complete.last_high == 125.0
     assert complete.last_high_time == start + timedelta(minutes=15)
     assert complete.recent_high_breakout is True
     assert complete.latest_failed_retest is True
+
+
+def test_feature_builder_uses_highest_closed_1m_candle_and_ignores_forming_high(make_frame) -> None:
+    start = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
+    frame = make_frame([100.0] * 20, start=start)
+    frame.loc[frame.index[5], "high"] = 150.0
+    frame.loc[frame.index[18], "high"] = 110.0
+    frame.loc[frame.index[19], "high"] = 200.0
+    builder = FeatureBuilder()
+
+    features = builder.build("TESTUSDT", frame, market_asof=start + timedelta(minutes=19, seconds=30))
+
+    assert features.last_high == 150.0
+    assert features.last_high_time == start + timedelta(minutes=6)
 
 
 def test_normalize_utc_treats_naive_sqlite_datetime_as_utc() -> None:

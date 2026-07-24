@@ -55,6 +55,7 @@ class FeatureBuilder:
         vol_zscore_1h = rolling_zscore(rolling_1h.fillna(0), window=24).iloc[-1]
 
         latest_structural = complete_5m.iloc[-1] if not complete_5m.empty else None
+        last_high_row = closed_1m.loc[closed_1m["high"].idxmax()] if not closed_1m.empty else None
         candle_metrics = (
             candle_shape(
                 float(latest_structural["open"]),
@@ -150,7 +151,7 @@ class FeatureBuilder:
             recent_high_breakout=recent_high_breakout,
             latest_body_atr_ratio=latest_body_atr_ratio,
             latest_failed_retest=latest_failed_retest,
-            last_high=float(closed_1m["high"].iloc[-1]) if not closed_1m.empty else 0.0,
+            last_high=float(last_high_row["high"]) if last_high_row is not None else 0.0,
             last_low=float(latest_structural["low"]) if latest_structural is not None else 0.0,
             last_close=float(latest_structural["close"]) if latest_structural is not None else 0.0,
             current_volume=float(latest_1m["volume"]),
@@ -160,7 +161,7 @@ class FeatureBuilder:
             orderbook_depth_usdt_2pct=liquidity_metrics["orderbook_depth_usdt_2pct"],
             liquidity_available=liquidity_metrics["liquidity_available"],
             market_asof=market_asof,
-            last_high_time=normalize_utc(closed_1m["timestamp"].iloc[-1]) + timedelta(minutes=1) if not closed_1m.empty else None,
+            last_high_time=normalize_utc(last_high_row["timestamp"]) + timedelta(minutes=1) if last_high_row is not None else None,
             last_structural_close_time=normalize_utc(latest_structural["timestamp"]) if latest_structural is not None else None,
         )
 
