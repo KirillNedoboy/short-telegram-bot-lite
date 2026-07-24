@@ -172,6 +172,38 @@ def test_evidence_is_deterministic_and_bounded() -> None:
     assert evidence.warnings == []
 
 
+def test_strategy_observation_outcome_can_be_updated_and_completed(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'strategy-observation-outcome.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    repository.record_strategy_observation(_observation())
+
+    due = repository.list_strategy_observations_due_outcomes(limit=10)
+    assert len(due) == 1
+    assert due[0]["observation_id"] == "observation-1"
+
+    repository.update_strategy_observation_outcome(
+        "observation-1",
+        {
+            "data_status": "complete",
+            "horizons": {"1m": {"price": 99.0}},
+            "mfe_pct": 4.0,
+            "mae_pct": 2.0,
+            "time_to_mfe_minutes": 3.0,
+            "time_to_mae_minutes": 1.0,
+            "new_high_after_observation": False,
+        },
+        updated_at=datetime(2026, 7, 24, 12, 20, tzinfo=timezone.utc),
+    )
+
+    assert repository.list_strategy_observations_due_outcomes(limit=10) == []
+    with database.engine.connect() as connection:
+        row = connection.exec_driver_sql(
+            "select outcome_status, outcome_mfe_pct, outcome_new_high_after_observation from strategy_observations"
+        ).one()
+    assert row == ("complete", 4.0, 0)
+
+
 def test_strategy_observation_schema_has_research_query_indexes(tmp_path) -> None:
     database = Database(f"sqlite:///{tmp_path / 'strategy-observation-indexes.sqlite'}")
     database.create_all()
@@ -183,3 +215,15 @@ def test_strategy_observation_schema_has_research_query_indexes(tmp_path) -> Non
         }
 
     assert "ix_strategy_observations_family_strategy_observed_at" in index_names
+    with database.engine.connect() as connection:
+        columns = {row[1] for row in connection.exec_driver_sql("pragma table_info('strategy_observations')").all()}
+    assert {
+        "outcome_status",
+        "outcome_json",
+        "outcome_mfe_pct",
+        "outcome_mae_pct",
+        "outcome_time_to_mfe_minutes",
+        "outcome_time_to_mae_minutes",
+        "outcome_new_high_after_observation",
+        "outcome_updated_at",
+    } <= columns

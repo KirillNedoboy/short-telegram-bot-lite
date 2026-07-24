@@ -642,6 +642,58 @@ class BotRepository:
             )
             return ObservationWriteResult(ObservationWriteStatus.FAILED)
 
+    def list_strategy_observations_due_outcomes(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        """Return target climax observations whose outcome is not complete."""
+
+        with self._db.session() as session:
+            statement = (
+                select(StrategyObservationModel)
+                .where(
+                    StrategyObservationModel.strategy.in_(("VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE")),
+                    StrategyObservationModel.outcome_status.is_not("complete"),
+                )
+                .order_by(StrategyObservationModel.observed_at.asc())
+                .limit(limit)
+            )
+            models = session.scalars(statement).all()
+            return [
+                {
+                    "observation_id": model.observation_id,
+                    "symbol": model.symbol,
+                    "observed_at": model.observed_at,
+                    "market_price": model.market_price,
+                    "event_high": model.event_high,
+                }
+                for model in models
+            ]
+
+    def update_strategy_observation_outcome(
+        self,
+        observation_id: str,
+        outcome: dict[str, Any],
+        *,
+        updated_at: datetime,
+    ) -> bool:
+        """Persist one research outcome without changing observation identity."""
+
+        status = str(outcome.get("data_status") or "unknown")
+        if status not in {"complete", "incomplete", "unknown"}:
+            raise ValueError(f"unsupported strategy observation outcome status: {status}")
+        with self._db.session() as session:
+            model = session.get(StrategyObservationModel, observation_id)
+            if model is None:
+                return False
+            model.outcome_status = status
+            model.outcome_json = _json_ready(outcome)
+            model.outcome_mfe_pct = _nullable_float(outcome.get("mfe_pct"))
+            model.outcome_mae_pct = _nullable_float(outcome.get("mae_pct"))
+            model.outcome_time_to_mfe_minutes = _nullable_float(outcome.get("time_to_mfe_minutes"))
+            model.outcome_time_to_mae_minutes = _nullable_float(outcome.get("time_to_mae_minutes"))
+            model.outcome_new_high_after_observation = outcome.get("new_high_after_observation")
+            model.outcome_updated_at = updated_at
+            session.flush()
+            return True
+
     def record_volume_climax_observation(
         self,
         *,

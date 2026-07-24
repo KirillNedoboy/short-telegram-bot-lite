@@ -67,6 +67,16 @@ class Database:
                 ("is_clean_short", "BOOLEAN"),
                 ("is_squeeze_before_tp", "BOOLEAN"),
             ],
+            "strategy_observations": [
+                ("outcome_status", "TEXT"),
+                ("outcome_json", "JSON"),
+                ("outcome_mfe_pct", "FLOAT"),
+                ("outcome_mae_pct", "FLOAT"),
+                ("outcome_time_to_mfe_minutes", "FLOAT"),
+                ("outcome_time_to_mae_minutes", "FLOAT"),
+                ("outcome_new_high_after_observation", "BOOLEAN"),
+                ("outcome_updated_at", "TIMESTAMP"),
+            ],
             "climax_evaluations": [
                 ("runtime_instance_id", "TEXT"),
                 ("root_event_id", "TEXT"),

@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 from app.market.bybit_client import BybitClient
-from app.market.candles import klines_to_frame
+from app.market.candles import klines_to_frame, normalize_utc
 from app.outcomes.evaluator import OutcomeEvaluator
+from app.outcomes.strategy_observations import evaluate_strategy_observation
 from app.storage.repository import BotRepository
 
 
+logger = logging.getLogger(__name__)
+
+
 class OutcomeTracker:
-    """Update stored signals with their live outcomes."""
+    """Update saved signals and climax observations with paper outcomes."""
 
     def __init__(self, client: BybitClient, repository: BotRepository) -> None:
         self._client = client
@@ -19,9 +24,14 @@ class OutcomeTracker:
         self._evaluator = OutcomeEvaluator()
 
     async def update_due_outcomes(self, now: datetime | None = None) -> int:
-        """Refresh outcomes for saved signals that still need data."""
+        """Refresh saved signal and strategy-observation outcomes."""
 
         now = now or datetime.now(timezone.utc)
+        updated = await self._update_signal_outcomes(now)
+        updated += await self._update_strategy_observation_outcomes(now)
+        return updated
+
+    async def _update_signal_outcomes(self, now: datetime) -> int:
         pending = self._repository.list_signals_missing_outcomes(now=now)
         updated = 0
         for signal in pending:
@@ -40,4 +50,55 @@ class OutcomeTracker:
                 continue
             self._repository.upsert_signal_outcome(outcome)
             updated += 1
+        return updated
+
+    async def _update_strategy_observation_outcomes(self, now: datetime) -> int:
+        list_due = getattr(self._repository, "list_strategy_observations_due_outcomes", None)
+        update_outcome = getattr(self._repository, "update_strategy_observation_outcome", None)
+        if list_due is None or update_outcome is None:
+            return 0
+
+        pending = list_due(limit=25)
+        updated = 0
+        for observation in pending:
+            observed_at = normalize_utc(observation["observed_at"])
+            start_ms = int(observed_at.timestamp() * 1000)
+            end_ms = int(min(now, observed_at + timedelta(minutes=15)).timestamp() * 1000)
+            try:
+                raw = await self._client.fetch_klines(
+                    observation["symbol"],
+                    "1",
+                    limit=100,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                )
+                frame = klines_to_frame(raw)
+                if observation["market_price"] is None:
+                    outcome = {
+                        "data_status": "unknown",
+                        "horizons": {},
+                        "mfe_pct": None,
+                        "mae_pct": None,
+                        "time_to_mfe_minutes": None,
+                        "time_to_mae_minutes": None,
+                        "new_high_after_observation": None,
+                        "observed_candles": 0,
+                        "coverage_end": None,
+                    }
+                else:
+                    outcome = evaluate_strategy_observation(
+                        observed_at=observed_at,
+                        entry_price=observation["market_price"],
+                        event_high=observation["event_high"],
+                        frame_1m=frame,
+                        now=now,
+                    )
+                if update_outcome(observation["observation_id"], outcome, updated_at=now):
+                    updated += 1
+            except Exception:
+                logger.exception(
+                    "strategy observation outcome update failed observation_id=%s symbol=%s",
+                    observation.get("observation_id"),
+                    observation.get("symbol"),
+                )
         return updated

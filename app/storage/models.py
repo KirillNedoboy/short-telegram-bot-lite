@@ -316,6 +316,14 @@ class StrategyObservationModel(Base):
     config_hash: Mapped[str] = mapped_column(String(64), index=True)
     input_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     input_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    outcome_status: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    outcome_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    outcome_mfe_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    outcome_mae_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    outcome_time_to_mfe_minutes: Mapped[float | None] = mapped_column(Float, nullable=True)
+    outcome_time_to_mae_minutes: Mapped[float | None] = mapped_column(Float, nullable=True)
+    outcome_new_high_after_observation: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    outcome_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ClimaxRootEventModel(Base):
