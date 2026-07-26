@@ -68,6 +68,8 @@ class Database:
                 ("is_squeeze_before_tp", "BOOLEAN"),
             ],
             "strategy_observations": [
+                ("runtime_started_at", "TIMESTAMP"),
+                ("code_version", "TEXT"),
                 ("outcome_status", "TEXT"),
                 ("outcome_json", "JSON"),
                 ("outcome_mfe_pct", "FLOAT"),
@@ -76,6 +78,8 @@ class Database:
                 ("outcome_time_to_mae_minutes", "FLOAT"),
                 ("outcome_new_high_after_observation", "BOOLEAN"),
                 ("outcome_updated_at", "TIMESTAMP"),
+                ("outcome_next_attempt_at", "TIMESTAMP"),
+                ("outcome_attempt_count", "INTEGER DEFAULT 0"),
             ],
             "climax_evaluations": [
                 ("runtime_instance_id", "TEXT"),
@@ -127,6 +131,11 @@ class Database:
                     if column_name in existing:
                         continue
                     connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl_type}")
+            if "strategy_observations" in columns_by_table:
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_strategy_observations_outcome_next_attempt_at "
+                    "ON strategy_observations(outcome_next_attempt_at)"
+                )
             if "signals" in columns_by_table:
                 index_names = {index["name"] for index in inspect(self.engine).get_indexes("signals")}
                 constraint_names = {constraint["name"] for constraint in inspect(self.engine).get_unique_constraints("signals")}

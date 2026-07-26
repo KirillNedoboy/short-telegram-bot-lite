@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import selectinload
 
@@ -600,6 +600,8 @@ class BotRepository:
                 "idempotency_key": observation.idempotency_key,
                 "run_id": observation.run_id,
                 "runtime_instance_id": observation.runtime_instance_id,
+                "runtime_started_at": observation.runtime_started_at,
+                "code_version": observation.code_version,
                 "strategy_family": observation.strategy_family,
                 "strategy": observation.strategy,
                 "evaluation_phase": observation.evaluation_phase,
@@ -642,19 +644,51 @@ class BotRepository:
             )
             return ObservationWriteResult(ObservationWriteStatus.FAILED)
 
-    def list_strategy_observations_due_outcomes(self, *, limit: int = 25) -> list[dict[str, Any]]:
+    def list_strategy_observations_due_outcomes(
+        self,
+        *,
+        limit: int = 25,
+        now: datetime | None = None,
+        exclude_observation_ids: set[str] | tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
         """Return target climax observations whose outcome is not complete."""
 
+        due_at = now or datetime.now(timezone.utc)
         with self._db.session() as session:
             statement = (
                 select(StrategyObservationModel)
                 .where(
                     StrategyObservationModel.strategy.in_(("VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE")),
-                    StrategyObservationModel.outcome_status.is_not("complete"),
+                    or_(
+                        StrategyObservationModel.outcome_status.is_(None),
+                        and_(
+                            StrategyObservationModel.outcome_status == "incomplete",
+                            or_(
+                                StrategyObservationModel.outcome_next_attempt_at.is_(None),
+                                StrategyObservationModel.outcome_next_attempt_at <= due_at,
+                            ),
+                        ),
+                        and_(
+                            StrategyObservationModel.outcome_status == "unknown",
+                            StrategyObservationModel.outcome_next_attempt_at.is_not(None),
+                            StrategyObservationModel.outcome_next_attempt_at <= due_at,
+                        ),
+                    ),
                 )
-                .order_by(StrategyObservationModel.observed_at.asc())
+                .order_by(
+                    func.coalesce(
+                        StrategyObservationModel.outcome_next_attempt_at,
+                        StrategyObservationModel.observed_at,
+                    ).asc(),
+                    StrategyObservationModel.observed_at.asc(),
+                    StrategyObservationModel.observation_id.asc(),
+                )
                 .limit(limit)
             )
+            if exclude_observation_ids:
+                statement = statement.where(
+                    StrategyObservationModel.observation_id.not_in(exclude_observation_ids)
+                )
             models = session.scalars(statement).all()
             return [
                 {
@@ -663,6 +697,7 @@ class BotRepository:
                     "observed_at": model.observed_at,
                     "market_price": model.market_price,
                     "event_high": model.event_high,
+                    "outcome_attempt_count": model.outcome_attempt_count or 0,
                 }
                 for model in models
             ]
@@ -673,6 +708,7 @@ class BotRepository:
         outcome: dict[str, Any],
         *,
         updated_at: datetime,
+        next_attempt_at: datetime | None = None,
     ) -> bool:
         """Persist one research outcome without changing observation identity."""
 
@@ -691,6 +727,8 @@ class BotRepository:
             model.outcome_time_to_mae_minutes = _nullable_float(outcome.get("time_to_mae_minutes"))
             model.outcome_new_high_after_observation = outcome.get("new_high_after_observation")
             model.outcome_updated_at = updated_at
+            model.outcome_next_attempt_at = next_attempt_at
+            model.outcome_attempt_count = (model.outcome_attempt_count or 0) + 1
             session.flush()
             return True
 

@@ -22,6 +22,7 @@ from app.events.state_store import EventStateStore
 from app.features.builder import FeatureBuilder
 from app.infra.health import ServiceHealth
 from app.infra.request_scheduler import RequestScheduler
+from app.infra.runtime_metadata import resolve_code_version
 from app.logger import configure_logging
 from app.market.bybit_client import BybitClient
 from app.market.scanner import MarketScanner
@@ -129,7 +130,9 @@ class ShortSignalBot:
         notifier: TelegramNotifier | None = None,
     ) -> None:
         self._config = config
+        self._runtime_started_at = datetime.now(timezone.utc)
         self._runtime_instance_id = uuid.uuid4().hex
+        self._code_version = resolve_code_version()
         self._config_fingerprint = _public_config_fingerprint(config)
         self._strategy_config_hash = _strategy_config_fingerprint(config)
         self._logger = logging.getLogger(self.__class__.__name__)
@@ -1148,6 +1151,8 @@ class ShortSignalBot:
                     idempotency_key=idempotency_key,
                     run_id=run_id,
                     runtime_instance_id=self._runtime_instance_id,
+                    runtime_started_at=self._runtime_started_at,
+                    code_version=self._code_version,
                     strategy_family="CLIMAX_EXHAUSTION",
                     strategy=strategy,
                     evaluation_phase=evaluation_phase,

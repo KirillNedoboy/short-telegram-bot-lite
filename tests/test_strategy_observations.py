@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
-from datetime import datetime, timezone
+from dataclasses import fields, replace
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
@@ -16,7 +16,12 @@ from app.storage.db import Database
 from app.storage.repository import BotRepository
 
 
-def _observation(*, runtime_instance_id: str = "runtime-1", strategy: str = "VOLUME_CLIMAX_UNWIND") -> StrategyObservation:
+def _observation(
+    *,
+    runtime_instance_id: str = "runtime-1",
+    strategy: str = "VOLUME_CLIMAX_UNWIND",
+    code_version: str = "test-code-version",
+) -> StrategyObservation:
     observed_at = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
     evidence = build_observation_evidence({"ret_5m": 3.0, "reason": "oi_missing"})
     key = make_observation_idempotency_key(
@@ -36,6 +41,8 @@ def _observation(*, runtime_instance_id: str = "runtime-1", strategy: str = "VOL
         idempotency_key=key,
         run_id="run-1",
         runtime_instance_id=runtime_instance_id,
+        runtime_started_at=observed_at - timedelta(minutes=5),
+        code_version=code_version,
         strategy_family="CLIMAX_EXHAUSTION",
         strategy=strategy,
         evaluation_phase="INITIAL",
@@ -204,6 +211,58 @@ def test_strategy_observation_outcome_can_be_updated_and_completed(tmp_path) -> 
     assert row == ("complete", 4.0, 0)
 
 
+def test_incomplete_outcome_retry_does_not_starve_later_observations(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'strategy-observation-retry.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    first = _observation()
+    second = replace(
+        _observation(strategy="LOW_VOLUME_EXTENSION_FAILURE"),
+        observation_id="observation-2",
+        observed_at=first.observed_at + timedelta(seconds=1),
+    )
+    repository.record_strategy_observation(first)
+    repository.record_strategy_observation(second)
+    now = first.observed_at + timedelta(hours=1)
+
+    repository.update_strategy_observation_outcome(
+        first.observation_id,
+        {"data_status": "incomplete", "data_reason": "AWAITING_15M_COVERAGE"},
+        updated_at=now,
+        next_attempt_at=now + timedelta(minutes=1),
+    )
+
+    due = repository.list_strategy_observations_due_outcomes(limit=1, now=now)
+    assert [row["observation_id"] for row in due] == [second.observation_id]
+
+
+def test_strategy_observation_contract_has_row_level_provenance() -> None:
+    field_names = {field.name for field in fields(StrategyObservation)}
+
+    assert {"runtime_instance_id", "code_version", "config_hash", "runtime_started_at"} <= field_names
+
+
+def test_additive_strategy_observation_migration_preserves_existing_rows(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'legacy-strategy-observation.sqlite'}")
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE strategy_observations (observation_id TEXT PRIMARY KEY, outcome_status TEXT)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO strategy_observations (observation_id, outcome_status) VALUES ('legacy-1', 'incomplete')"
+        )
+
+    database.create_all()
+
+    with database.engine.connect() as connection:
+        columns = {row[1] for row in connection.exec_driver_sql("pragma table_info('strategy_observations')").all()}
+        legacy_row = connection.exec_driver_sql(
+            "select observation_id, outcome_status from strategy_observations"
+        ).one()
+    assert {"code_version", "runtime_started_at", "outcome_next_attempt_at", "outcome_attempt_count"} <= columns
+    assert legacy_row == ("legacy-1", "incomplete")
+
+
 def test_strategy_observation_schema_has_research_query_indexes(tmp_path) -> None:
     database = Database(f"sqlite:///{tmp_path / 'strategy-observation-indexes.sqlite'}")
     database.create_all()
@@ -226,4 +285,8 @@ def test_strategy_observation_schema_has_research_query_indexes(tmp_path) -> Non
         "outcome_time_to_mae_minutes",
         "outcome_new_high_after_observation",
         "outcome_updated_at",
+        "code_version",
+        "runtime_started_at",
+        "outcome_next_attempt_at",
+        "outcome_attempt_count",
     } <= columns

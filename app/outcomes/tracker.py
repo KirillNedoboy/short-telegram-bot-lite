@@ -8,11 +8,18 @@ from datetime import datetime, timedelta, timezone
 from app.market.bybit_client import BybitClient
 from app.market.candles import klines_to_frame, normalize_utc
 from app.outcomes.evaluator import OutcomeEvaluator
-from app.outcomes.strategy_observations import evaluate_strategy_observation
+from app.outcomes.strategy_observations import (
+    empty_strategy_observation_outcome,
+    evaluate_strategy_observation,
+    observation_coverage_ready_at,
+)
 from app.storage.repository import BotRepository
 
 
 logger = logging.getLogger(__name__)
+
+STRATEGY_OBSERVATION_OUTCOME_BATCH_SIZE = 25
+STRATEGY_OBSERVATION_OUTCOME_MAX_BATCHES = 4
 
 
 class OutcomeTracker:
@@ -58,47 +65,99 @@ class OutcomeTracker:
         if list_due is None or update_outcome is None:
             return 0
 
-        pending = list_due(limit=25)
         updated = 0
-        for observation in pending:
-            observed_at = normalize_utc(observation["observed_at"])
-            start_ms = int(observed_at.timestamp() * 1000)
-            end_ms = int(min(now, observed_at + timedelta(minutes=15)).timestamp() * 1000)
-            try:
-                raw = await self._client.fetch_klines(
-                    observation["symbol"],
-                    "1",
-                    limit=100,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
+        attempted_observation_ids: set[str] = set()
+        for _ in range(STRATEGY_OBSERVATION_OUTCOME_MAX_BATCHES):
+            pending = list_due(
+                limit=STRATEGY_OBSERVATION_OUTCOME_BATCH_SIZE,
+                now=now,
+                exclude_observation_ids=attempted_observation_ids,
+            )
+            if not pending:
+                break
+            attempted_observation_ids.update(str(row["observation_id"]) for row in pending)
+            for observation in pending:
+                outcome = await self._evaluate_strategy_observation_outcome(observation, now)
+                next_attempt_at = _next_outcome_attempt_at(
+                    outcome,
+                    now=now,
+                    attempt_count=int(observation.get("outcome_attempt_count") or 0),
                 )
-                frame = klines_to_frame(raw)
-                if observation["market_price"] is None:
-                    outcome = {
-                        "data_status": "unknown",
-                        "horizons": {},
-                        "mfe_pct": None,
-                        "mae_pct": None,
-                        "time_to_mfe_minutes": None,
-                        "time_to_mae_minutes": None,
-                        "new_high_after_observation": None,
-                        "observed_candles": 0,
-                        "coverage_end": None,
-                    }
-                else:
-                    outcome = evaluate_strategy_observation(
-                        observed_at=observed_at,
-                        entry_price=observation["market_price"],
-                        event_high=observation["event_high"],
-                        frame_1m=frame,
-                        now=now,
+                try:
+                    if update_outcome(
+                        observation["observation_id"],
+                        outcome,
+                        updated_at=now,
+                        next_attempt_at=next_attempt_at,
+                    ):
+                        updated += 1
+                except Exception:
+                    logger.exception(
+                        "strategy observation outcome persistence failed observation_id=%s symbol=%s",
+                        observation.get("observation_id"),
+                        observation.get("symbol"),
                     )
-                if update_outcome(observation["observation_id"], outcome, updated_at=now):
-                    updated += 1
-            except Exception:
-                logger.exception(
-                    "strategy observation outcome update failed observation_id=%s symbol=%s",
-                    observation.get("observation_id"),
-                    observation.get("symbol"),
-                )
         return updated
+
+    async def _evaluate_strategy_observation_outcome(
+        self,
+        observation: dict[str, object],
+        now: datetime,
+    ) -> dict[str, object]:
+        market_price = observation.get("market_price")
+        if market_price is None:
+            return empty_strategy_observation_outcome(
+                data_status="unknown",
+                data_reason="MISSING_MARKET_PRICE",
+            )
+        if float(market_price) <= 0:
+            return empty_strategy_observation_outcome(
+                data_status="unknown",
+                data_reason="INVALID_MARKET_PRICE",
+            )
+
+        observed_at = normalize_utc(observation["observed_at"])
+        start_ms = int(observed_at.timestamp() * 1000)
+        end_ms = int(min(now, observation_coverage_ready_at(observed_at)).timestamp() * 1000)
+        try:
+            raw = await self._client.fetch_klines(
+                str(observation["symbol"]),
+                "1",
+                limit=100,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+            frame = klines_to_frame(raw)
+            return evaluate_strategy_observation(
+                observed_at=observed_at,
+                entry_price=float(market_price),
+                event_high=observation.get("event_high"),
+                frame_1m=frame,
+                now=now,
+            )
+        except Exception:
+            logger.exception(
+                "strategy observation outcome fetch failed observation_id=%s symbol=%s",
+                observation.get("observation_id"),
+                observation.get("symbol"),
+            )
+            return empty_strategy_observation_outcome(
+                data_status="unknown",
+                data_reason="MARKET_DATA_FETCH_FAILED",
+                retryable=True,
+            )
+
+
+def _next_outcome_attempt_at(
+    outcome: dict[str, object],
+    *,
+    now: datetime,
+    attempt_count: int,
+) -> datetime | None:
+    if not outcome.get("retryable"):
+        return None
+    status = str(outcome.get("data_status") or "unknown")
+    if status == "incomplete":
+        return now + timedelta(minutes=1)
+    delay_minutes = min(60, 2 ** min(attempt_count, 6))
+    return now + timedelta(minutes=delay_minutes)

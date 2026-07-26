@@ -293,6 +293,8 @@ class StrategyObservationModel(Base):
     idempotency_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     run_id: Mapped[str] = mapped_column(String(64), index=True)
     runtime_instance_id: Mapped[str] = mapped_column(String(64), index=True)
+    runtime_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    code_version: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     strategy_family: Mapped[str] = mapped_column(String(64), index=True)
     strategy: Mapped[str] = mapped_column(String(64), index=True)
     evaluation_phase: Mapped[str] = mapped_column(String(32), index=True)
@@ -324,6 +326,8 @@ class StrategyObservationModel(Base):
     outcome_time_to_mae_minutes: Mapped[float | None] = mapped_column(Float, nullable=True)
     outcome_new_high_after_observation: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     outcome_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    outcome_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class ClimaxRootEventModel(Base):

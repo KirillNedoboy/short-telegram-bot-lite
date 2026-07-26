@@ -37,6 +37,8 @@ class StrategyObservation:
     idempotency_key: str
     run_id: str
     runtime_instance_id: str
+    runtime_started_at: datetime
+    code_version: str
     strategy_family: str
     strategy: str
     evaluation_phase: str

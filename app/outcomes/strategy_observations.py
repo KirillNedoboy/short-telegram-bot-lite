@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 import pandas as pd
@@ -34,17 +34,23 @@ def evaluate_strategy_observation(
     observed = _as_utc(observed_at)
     asof = _as_utc(now) if now is not None else None
     if frame_1m.empty:
-        return _empty_outcome()
+        if asof is None or asof < observation_coverage_ready_at(observed):
+            return _missing_future_outcome(observed, asof or observed)
+        return empty_strategy_observation_outcome(
+            data_status="unknown",
+            data_reason="NO_KLINES",
+            retryable=True,
+        )
 
     market_asof = asof or _frame_end(frame_1m)
     closed = closed_1m_rows(frame_1m, market_asof)
     if closed.empty:
-        return _empty_outcome()
+        return _missing_future_outcome(observed, market_asof)
 
     timestamps = _timestamps(closed)
     future = closed.loc[(timestamps > observed) & (timestamps <= market_asof)].copy()
     if future.empty:
-        return _empty_outcome()
+        return _missing_future_outcome(observed, market_asof)
 
     future["_timestamp"] = _timestamps(future)
     future = future.sort_values("_timestamp").reset_index(drop=True)
@@ -67,6 +73,8 @@ def evaluate_strategy_observation(
     data_status = "complete" if all(item["price"] is not None for item in horizons.values()) else "incomplete"
     return {
         "data_status": data_status,
+        "data_reason": None if data_status == "complete" else "AWAITING_15M_COVERAGE",
+        "retryable": data_status == "incomplete",
         "horizons": horizons,
         "mfe_pct": mfe_pct,
         "mae_pct": mae_pct,
@@ -78,9 +86,16 @@ def evaluate_strategy_observation(
     }
 
 
-def _empty_outcome() -> dict[str, Any]:
+def empty_strategy_observation_outcome(
+    *,
+    data_status: str,
+    data_reason: str,
+    retryable: bool = False,
+) -> dict[str, Any]:
     return {
-        "data_status": "unknown",
+        "data_status": data_status,
+        "data_reason": data_reason,
+        "retryable": retryable,
         "horizons": {
             label: {"price": None, "price_change_pct": None, "short_return_pct": None}
             for label, _ in HORIZONS_MINUTES
@@ -93,6 +108,29 @@ def _empty_outcome() -> dict[str, Any]:
         "observed_candles": 0,
         "coverage_end": None,
     }
+
+
+def observation_coverage_ready_at(observed_at: datetime) -> datetime:
+    """Return when the first candle at or after the 15m target is closed."""
+
+    target = _as_utc(observed_at) + timedelta(minutes=15)
+    minute = target.replace(second=0, microsecond=0)
+    first_candle_open = minute if target == minute else minute + timedelta(minutes=1)
+    return first_candle_open + timedelta(minutes=1)
+
+
+def _missing_future_outcome(observed_at: datetime, market_asof: datetime) -> dict[str, Any]:
+    if market_asof < observation_coverage_ready_at(observed_at):
+        return empty_strategy_observation_outcome(
+            data_status="incomplete",
+            data_reason="AWAITING_CLOSED_FUTURE_CANDLES",
+            retryable=True,
+        )
+    return empty_strategy_observation_outcome(
+        data_status="unknown",
+        data_reason="NO_CLOSED_FUTURE_CANDLES",
+        retryable=True,
+    )
 
 
 def _timestamps(frame: pd.DataFrame) -> pd.Series:

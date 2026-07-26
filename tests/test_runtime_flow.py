@@ -299,7 +299,9 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
     make_features,
     monkeypatch,
 ) -> None:
-    async def _run() -> tuple[object | None, list[tuple[str, str, str]]]:
+    monkeypatch.setenv("SHORT_BOT_CODE_VERSION", "test-code-version")
+
+    async def _run() -> tuple[object | None, list[tuple[str, str, str, str, str, datetime]]]:
         database = Database(f"sqlite:///{tmp_path / 'climax-observation-branches.db'}")
         database.create_all()
         repository = BotRepository(database)
@@ -336,7 +338,14 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
         decision = await bot._evaluate_and_send_climax("ONTUSDT", object(), state, features=features)
         with database.session() as session:
             rows = [
-                (row.strategy, row.evaluation_phase, row.live_decision)
+                (
+                    row.strategy,
+                    row.evaluation_phase,
+                    row.live_decision,
+                    row.code_version,
+                    row.runtime_instance_id,
+                    row.runtime_started_at,
+                )
                 for row in session.scalars(select(StrategyObservationModel).order_by(StrategyObservationModel.strategy)).all()
             ]
         return decision, rows
@@ -344,10 +353,13 @@ def test_climax_initial_evaluation_records_every_enabled_branch(
     decision, rows = asyncio.run(_run())
 
     assert decision is not None
-    assert rows == [
+    assert [(strategy, phase, live) for strategy, phase, live, *_ in rows] == [
         ("LOW_VOLUME_EXTENSION_FAILURE", "INITIAL", "BLOCKED"),
         ("VOLUME_CLIMAX_UNWIND", "INITIAL", "ACTIONABLE"),
     ]
+    assert {code_version for *_, code_version, _runtime_id, _started_at in rows} == {"test-code-version"}
+    assert len({runtime_id for *_, runtime_id, _started_at in rows}) == 1
+    assert all(runtime_started_at is not None for *_, runtime_started_at in rows)
 
 
 def test_low_volume_recheck_records_all_branches_before_delivery_veto(
