@@ -15,7 +15,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import selectinload
 
-from app.domain import EventState, EventStatus, SignalDecision, SignalOutcome, SignalRecord, WatchCandidateRecord
+from app.domain import EventState, EventStatus, SignalDecision, SignalOutcome, SignalProvenanceInput, SignalRecord, WatchCandidateRecord
 from app.market.coverage import coverage_percent, universe_fingerprint
 from app.observability.strategy_observations import ObservationWriteResult, ObservationWriteStatus, StrategyObservation
 from app.storage.db import Database
@@ -35,6 +35,7 @@ from app.storage.models import (
     MarketScanSymbolResultModel,
     SignalModel,
     SignalOutcomeModel,
+    SignalProvenanceModel,
     StrategyObservationModel,
     TelegramDeliveryOutboxModel,
     WatchCandidateModel,
@@ -267,6 +268,8 @@ class BotRepository:
         event_state: EventState,
         telegram_sent: bool,
         delivery_payload: str | None = None,
+        *,
+        provenance: SignalProvenanceInput,
     ) -> SignalRecord:
         if decision.signal_type.value == "Watch":
             raise ValueError("WATCH decisions must be stored via save_watch_candidate")
@@ -325,6 +328,25 @@ class BotRepository:
             )
             session.add(model)
             session.flush()
+            if provenance.event_id != model.event_id:
+                raise ValueError("signal provenance event_id must match signal event_id")
+            session.add(
+                SignalProvenanceModel(
+                    signal_id=model.id,
+                    strategy_family=provenance.strategy_family,
+                    strategy_branch=provenance.strategy_branch,
+                    event_id=provenance.event_id,
+                    root_event_id=provenance.root_event_id,
+                    decision_evaluation_id=provenance.decision_evaluation_id,
+                    admission_evaluation_id=provenance.admission_evaluation_id,
+                    code_version=provenance.code_version,
+                    config_hash=provenance.config_hash,
+                    runtime_instance_id=provenance.runtime_instance_id,
+                    runtime_started_at=provenance.runtime_started_at,
+                    decision_at=provenance.decision_at,
+                    signal_created_at=model.created_at,
+                )
+            )
             if delivery_payload is not None:
                 session.add(
                     TelegramDeliveryOutboxModel(

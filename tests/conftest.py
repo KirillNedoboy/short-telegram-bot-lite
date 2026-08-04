@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import pytest
 
-from app.domain import EventState, EventStatus, SignalDecision, SignalRecord, SignalType, SymbolFeatures
+from app.domain import EventState, EventStatus, SignalDecision, SignalProvenanceInput, SignalRecord, SignalType, SymbolFeatures
 
 
 def _make_frame(
@@ -155,6 +155,25 @@ def _make_signal_decision(**overrides: object) -> SignalDecision:
     return SignalDecision(**base)
 
 
+def _make_signal_provenance(**overrides: object) -> SignalProvenanceInput:
+    decision_at = datetime(2026, 4, 13, 12, 5, tzinfo=timezone.utc)
+    base = dict(
+        strategy_family="BASELINE_PULLBACK",
+        strategy_branch="BASELINE_PULLBACK",
+        event_id="ONTUSDT:15m:1:111",
+        root_event_id=None,
+        decision_evaluation_id=None,
+        admission_evaluation_id=None,
+        code_version="test-code-version",
+        config_hash="a" * 64,
+        runtime_instance_id="test-runtime",
+        runtime_started_at=decision_at - timedelta(minutes=1),
+        decision_at=decision_at,
+    )
+    base.update(overrides)
+    return SignalProvenanceInput(**base)
+
+
 def _make_signal_record(**overrides: object) -> SignalRecord:
     """Create a saved signal record for outcome tests."""
 
@@ -210,6 +229,11 @@ def make_event_state():
 @pytest.fixture
 def make_signal_decision():
     return _make_signal_decision
+
+
+@pytest.fixture
+def make_signal_provenance():
+    return _make_signal_provenance
 
 
 @pytest.fixture

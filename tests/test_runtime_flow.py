@@ -83,14 +83,14 @@ class _ExplodingNotifier(_FakeNotifier):
         raise RuntimeError("telegram transport down")
 
 
-def test_notifier_failure_leaves_signal_retryable_in_outbox(tmp_path, make_event_state, make_signal_decision) -> None:
+def test_notifier_failure_leaves_signal_retryable_in_outbox(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     async def _run() -> tuple[object, object]:
         database = Database(f"sqlite:///{tmp_path / 'delivery-failure.db'}")
         database.create_all()
         repository = BotRepository(database)
         state = repository.upsert_event_state(make_event_state())
         signal = repository.save_signal(
-            make_signal_decision(), state, telegram_sent=False, delivery_payload="immutable payload"
+            make_signal_decision(), state, telegram_sent=False, delivery_payload="immutable payload", provenance=make_signal_provenance()
         )
         bot = ShortSignalBot(
             config=AppConfig(),

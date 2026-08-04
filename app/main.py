@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 
 from app.config import AppConfig, load_config
-from app.domain import EventState, EventStatus, SignalDecision, SignalType, SymbolFeatures
+from app.domain import EventState, EventStatus, SignalDecision, SignalProvenanceInput, SignalType, SymbolFeatures
 from app.events.pump_detector import PumpDetector
 from app.events.pullback_tracker import PullbackTracker
 from app.events.short_zone import ShortZoneBuilder
@@ -977,6 +977,7 @@ class ShortSignalBot:
             model_version=model_version,
             strategy_metadata={**evaluation.metadata, "veto_reasons": evaluation.veto_reasons, "fast_monitor": fast_monitor},
         )
+        admission_evaluation_id = evaluation_id
         if decision.strategy_subtype == "LOW_VOLUME_EXTENSION_FAILURE":
             event_high = float(decision.strategy_metadata.get("event_high") or 0.0)
             stored_distance = float(decision.strategy_metadata.get("entry_distance_below_high_pct") or 0.0)
@@ -1066,6 +1067,7 @@ class ShortSignalBot:
                     if not fresh_eval.actionable or fresh_eval.subtype != "LOW_VOLUME_EXTENSION_FAILURE":
                         self._logger.info("Climax delivery veto: fresh_admission_failed symbol=%s reasons=%s", symbol, fresh_eval.veto_reasons)
                         return None
+                    admission_evaluation_id = fresh_evaluation_id
         if not live_delivery_enabled(decision, self._config):
             self._logger.warning(
                 "live_delivery_disabled strategy_type=%s strategy_subtype=%s",
@@ -1074,7 +1076,18 @@ class ShortSignalBot:
             )
             return None
         payload = format_signal_message(decision, self._config.timezone)
-        record = self._repository.save_signal(decision, state, telegram_sent=False, delivery_payload=payload)
+        record = self._repository.save_signal(
+            decision,
+            state,
+            telegram_sent=False,
+            delivery_payload=payload,
+            provenance=self._signal_provenance(
+                decision,
+                root_event_id=root_event_id,
+                decision_evaluation_id=evaluation_id,
+                admission_evaluation_id=admission_evaluation_id,
+            ),
+        )
         telegram_sent = await self._send_new_delivery(entity_type="SIGNAL", entity_id=record.id)
         if not telegram_sent:
             self._logger.warning("Telegram delivery pending/retry | signal_id=%s", record.id)
@@ -1187,6 +1200,51 @@ class ShortSignalBot:
                 )
                 results.append(ObservationWriteResult(ObservationWriteStatus.FAILED))
         return results
+
+    def _signal_provenance(
+        self,
+        decision: SignalDecision,
+        *,
+        root_event_id: str | None = None,
+        decision_evaluation_id: int | None = None,
+        admission_evaluation_id: int | None = None,
+    ) -> SignalProvenanceInput:
+        """Build immutable evidence for a signal without changing admission semantics."""
+
+        if decision.strategy_type == "BASELINE_PULLBACK":
+            return SignalProvenanceInput(
+                strategy_family="BASELINE_PULLBACK",
+                strategy_branch="BASELINE_PULLBACK",
+                event_id=decision.event_id,
+                root_event_id=None,
+                decision_evaluation_id=None,
+                admission_evaluation_id=None,
+                code_version=self._code_version,
+                config_hash=self._strategy_config_hash,
+                runtime_instance_id=self._runtime_instance_id,
+                runtime_started_at=self._runtime_started_at,
+                decision_at=decision.signal_time,
+            )
+        if (
+            decision.strategy_type != "CLIMAX_EXHAUSTION"
+            or decision.strategy_subtype not in {"VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE"}
+            or root_event_id is None
+            or decision_evaluation_id is None
+        ):
+            raise ValueError("actionable signal has incomplete deterministic provenance")
+        return SignalProvenanceInput(
+            strategy_family="CLIMAX_EXHAUSTION",
+            strategy_branch=decision.strategy_subtype,
+            event_id=decision.event_id,
+            root_event_id=root_event_id,
+            decision_evaluation_id=decision_evaluation_id,
+            admission_evaluation_id=admission_evaluation_id,
+            code_version=self._code_version,
+            config_hash=self._strategy_config_hash,
+            runtime_instance_id=self._runtime_instance_id,
+            runtime_started_at=self._runtime_started_at,
+            decision_at=decision.signal_time,
+        )
 
     @staticmethod
     def _observation_live_decision(evaluation: ClimaxEvaluation, evaluation_phase: str) -> str:
@@ -1360,7 +1418,13 @@ class ShortSignalBot:
             )
             return None, state
         payload = format_signal_message(decision, self._config.timezone)
-        record = self._repository.save_signal(decision, state, telegram_sent=False, delivery_payload=payload)
+        record = self._repository.save_signal(
+            decision,
+            state,
+            telegram_sent=False,
+            delivery_payload=payload,
+            provenance=self._signal_provenance(decision),
+        )
         telegram_sent = await self._send_new_delivery(entity_type="SIGNAL", entity_id=record.id)
         if not telegram_sent:
             self._logger.warning("Telegram delivery pending/retry | signal_id=%s", record.id)

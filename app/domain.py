@@ -181,6 +181,23 @@ class SignalDecision:
     strategy_metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class SignalProvenanceInput:
+    """Immutable evidence attached to a newly persisted live signal."""
+
+    strategy_family: str
+    strategy_branch: str
+    event_id: str
+    root_event_id: str | None
+    decision_evaluation_id: int | None
+    admission_evaluation_id: int | None
+    code_version: str
+    config_hash: str
+    runtime_instance_id: str
+    runtime_started_at: datetime
+    decision_at: datetime
+
+
 @dataclass(slots=True)
 class CandidateEvaluation:
     """Structured result of evaluating a mature candidate."""

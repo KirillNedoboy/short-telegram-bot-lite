@@ -67,7 +67,7 @@ def _seed_reject_rows(repository: BotRepository) -> None:
     )
 
 
-def _seed_outcomes(repository: BotRepository, make_event_state, make_signal_decision) -> None:
+def _seed_outcomes(repository: BotRepository, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     state = repository.upsert_event_state(make_event_state())
     old_signal = repository.save_signal(
         make_signal_decision(
@@ -77,6 +77,7 @@ def _seed_outcomes(repository: BotRepository, make_event_state, make_signal_deci
         ),
         state,
         telegram_sent=False,
+        provenance=make_signal_provenance(event_id="OLDUSDT:15m:1:111"),
     )
     repository.upsert_signal_outcome(
         SignalOutcome(
@@ -99,6 +100,7 @@ def _seed_outcomes(repository: BotRepository, make_event_state, make_signal_deci
         ),
         state,
         telegram_sent=False,
+        provenance=make_signal_provenance(event_id="NEWUSDT:15m:1:222"),
     )
     repository.upsert_signal_outcome(
         SignalOutcome(
@@ -181,12 +183,12 @@ def test_derivatives_report_with_since_shows_only_post_restart_statuses(tmp_path
     assert report["data_quality_counts"] == {}
 
 
-def test_outcome_report_with_since_excludes_older_rows(tmp_path, monkeypatch, capsys, make_event_state, make_signal_decision) -> None:
+def test_outcome_report_with_since_excludes_older_rows(tmp_path, monkeypatch, capsys, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     db_path = tmp_path / "outcomes-report.db"
     database = Database(f"sqlite:///{db_path}")
     database.create_all()
     repository = BotRepository(database)
-    _seed_outcomes(repository, make_event_state, make_signal_decision)
+    _seed_outcomes(repository, make_event_state, make_signal_decision, make_signal_provenance)
     _write_config(tmp_path, db_path)
 
     monkeypatch.chdir(tmp_path)

@@ -6,7 +6,7 @@ from app.storage.db import Database
 from app.storage.repository import BotRepository
 
 
-def test_repository_round_trip(tmp_path, make_event_state, make_signal_decision) -> None:
+def test_repository_round_trip(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     db_path = tmp_path / "bot.db"
     database = Database(f"sqlite:///{db_path}")
     database.create_all()
@@ -16,7 +16,7 @@ def test_repository_round_trip(tmp_path, make_event_state, make_signal_decision)
         make_event_state(expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
     )
     active = repository.list_active_event_states()
-    record = repository.save_signal(make_signal_decision(), saved_state, telegram_sent=True)
+    record = repository.save_signal(make_signal_decision(), saved_state, telegram_sent=True, provenance=make_signal_provenance())
     outcome = repository.upsert_signal_outcome(
         SignalOutcome(
             signal_id=record.id,

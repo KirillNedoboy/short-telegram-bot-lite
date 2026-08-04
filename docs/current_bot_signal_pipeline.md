@@ -196,7 +196,8 @@ This is the effective signal path from live market data to Telegram and later to
 19. **Persist signal and delivery intent before Telegram**
    - Files: `app/storage/repository.py`, `app/storage/models.py`
    - Functions: `BotRepository.save_signal()`, `BotRepository.save_watch_candidate()`
-   - The source row is created with `telegram_sent=False` and, for enabled delivery, an immutable `telegram_delivery_outbox` payload in the same transaction.
+   - The source row, one immutable `signal_provenance` row, and, for enabled delivery, an immutable `telegram_delivery_outbox` payload are created in the same transaction.
+   - Provenance stores the exact live branch. For climax it carries initial evaluation evidence and, after LOW_VOLUME recheck, the final admission evaluation evidence; it does not update append-only observations.
    - Live V1 delivery is allowed separately for `BASELINE_PULLBACK`, `VOLUME_CLIMAX_UNWIND`, and `LOW_VOLUME_EXTENSION_FAILURE`; all three shipped gates are `true`.
    - `VOLUME_CLIMAX_LIFECYCLE_SHADOW_V2` remains research telemetry and does not control V1 admission. WATCH delivery remains disabled by `send_watch_to_telegram=false`.
 
@@ -216,6 +217,7 @@ This is the effective signal path from live market data to Telegram and later to
    - `False`/exception persists `RETRY`; five attempts become `DEAD`.
    - The outbox is at-least-once and does not auto-enqueue historical unsent rows.
    - It is not exactly-once: an ambiguous Telegram acknowledgement can result in a duplicate on retry.
+   - Analytics joins signals only through `telegram_delivery_outbox.entity_type = 'SIGNAL'` and `entity_id = signals.id`; the literal is uppercase.
 
 21. **Persist signal evidence**
    - Stored data includes:

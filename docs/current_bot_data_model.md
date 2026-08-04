@@ -4,9 +4,10 @@
 
 Real storage is SQLite, configured by default as `sqlite:///./data/bot.sqlite` and normalized to an absolute path at runtime by `app/storage/db.py`.
 
-Observed tables in the local snapshot:
+Core tables in the current schema:
 
 - `signals`
+- `signal_provenance`
 - `signal_outcomes`
 - `event_states`
 - `strategy_observations`
@@ -95,6 +96,14 @@ Write timing:
 - inserted once at signal emission by `BotRepository.save_signal()`
 - `telegram_sent` is updated atomically with outbox `SENT` after delivery
 - retry/dead-letter metadata is stored in `telegram_delivery_outbox`
+
+### `signal_provenance`
+
+`signal_provenance` is an immutable, one-to-one evidence row created with every newly emitted live signal. It preserves the exact strategy branch (`BASELINE_PULLBACK`, `VOLUME_CLIMAX_UNWIND`, or `LOW_VOLUME_EXTENSION_FAILURE`), source event/root, initial and final admission evaluation references, and code/config/runtime timestamps.
+
+`signals.strategy_type` remains a strategy family for delivery-policy compatibility. Analytics must use `signal_provenance.strategy_branch` for new rows and must label rows without provenance as `LEGACY_UNKNOWN_BRANCH` unless a strict persisted reference proves otherwise. No legacy signal or observation is backfilled by timestamp, symbol, root, or nearest-match heuristics.
+
+For climax signals, an exact observation join uses the provenance evaluation reference plus `strategy_observations.strategy = signal_provenance.strategy_branch`; observations remain append-only.
 
 ### `signal_outcomes`
 
@@ -253,6 +262,8 @@ The `signals` row itself is append-only in current behavior.
 `TelegramDeliveryOutboxModel` is the durable delivery queue for newly emitted signal and WATCH rows. It stores `entity_type`, `entity_id`, `channel`, immutable `payload`, `idempotency_key`, `status`, `attempt_count`, `next_attempt_at`, `last_attempt_at`, `lease_until`, `sent_at`, `last_error`, and `created_at`.
 
 Delivery is at-least-once, not exactly-once: if Telegram accepts a request but the acknowledgement is lost, a retry can duplicate the message. Historical rows with `telegram_sent=false` are not backfilled into this table automatically.
+
+The canonical signal join is `entity_type = 'SIGNAL' AND entity_id = signals.id`; `SIGNAL` is uppercase. Reports retain raw queue status and normalize only for presentation: `SENT`; pending (`PENDING`, `RETRY`, `IN_FLIGHT`); failed (`DEAD`); or `NO_OUTBOX`.
 
 ### `strategy_observations`
 

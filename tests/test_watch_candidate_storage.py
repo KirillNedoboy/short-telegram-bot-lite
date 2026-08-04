@@ -77,12 +77,12 @@ def test_watch_candidate_missing_dist_to_vwap_pct_is_stored_without_integrity_er
         assert stored.actionable is False
 
 
-def test_delivery_status_can_be_updated_after_durable_insert(tmp_path, make_event_state, make_signal_decision) -> None:
+def test_delivery_status_can_be_updated_after_durable_insert(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     database = Database(f"sqlite:///{tmp_path / 'delivery-status.db'}")
     database.create_all()
     repository = BotRepository(database)
     state = repository.upsert_event_state(make_event_state())
-    signal = repository.save_signal(make_signal_decision(), state, telegram_sent=False)
+    signal = repository.save_signal(make_signal_decision(), state, telegram_sent=False, provenance=make_signal_provenance())
     watch_decision = make_signal_decision(
         signal_type=SignalType.WATCH,
         actionable=False,
@@ -100,13 +100,13 @@ def test_delivery_status_can_be_updated_after_durable_insert(tmp_path, make_even
 
 
 
-def test_actionable_signal_still_persists_dist_to_vwap_pct(tmp_path, make_event_state, make_signal_decision) -> None:
+def test_actionable_signal_still_persists_dist_to_vwap_pct(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     database = Database(f"sqlite:///{tmp_path / 'signal.db'}")
     database.create_all()
     repository = BotRepository(database)
     state = repository.upsert_event_state(make_event_state())
 
-    record = repository.save_signal(make_signal_decision(), state, telegram_sent=True)
+    record = repository.save_signal(make_signal_decision(), state, telegram_sent=True, provenance=make_signal_provenance())
 
     assert record.signal_type == "Aggressive"
     assert record.dist_to_vwap_pct == 13.0
@@ -116,7 +116,7 @@ def test_actionable_signal_still_persists_dist_to_vwap_pct(tmp_path, make_event_
         assert session.scalars(select(WatchCandidateModel)).all() == []
 
 
-def test_signal_delivery_outbox_is_atomic_and_retryable(tmp_path, make_event_state, make_signal_decision) -> None:
+def test_signal_delivery_outbox_is_atomic_and_retryable(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     database = Database(f"sqlite:///{tmp_path / 'outbox.db'}")
     database.create_all()
     repository = BotRepository(database)
@@ -127,6 +127,7 @@ def test_signal_delivery_outbox_is_atomic_and_retryable(tmp_path, make_event_sta
         state,
         telegram_sent=False,
         delivery_payload="signal payload",
+        provenance=make_signal_provenance(),
     )
 
     with database.session() as session:
@@ -154,12 +155,12 @@ def test_signal_delivery_outbox_is_atomic_and_retryable(tmp_path, make_event_sta
         assert outbox.last_error == "telegram unavailable"
 
 
-def test_delivery_lease_expiry_requeues_item(tmp_path, make_event_state, make_signal_decision) -> None:
+def test_delivery_lease_expiry_requeues_item(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     database = Database(f"sqlite:///{tmp_path / 'lease.db'}")
     database.create_all()
     repository = BotRepository(database)
     state = repository.upsert_event_state(make_event_state())
-    repository.save_signal(make_signal_decision(), state, telegram_sent=False, delivery_payload="payload")
+    repository.save_signal(make_signal_decision(), state, telegram_sent=False, delivery_payload="payload", provenance=make_signal_provenance())
     now = datetime.now(timezone.utc)
 
     first = repository.claim_due_deliveries(now, limit=1, lease_seconds=1)
@@ -169,12 +170,12 @@ def test_delivery_lease_expiry_requeues_item(tmp_path, make_event_state, make_si
     assert second[0]["attempt_count"] == 2
 
 
-def test_delivery_lease_expiry_after_max_attempts_becomes_dead(tmp_path, make_event_state, make_signal_decision) -> None:
+def test_delivery_lease_expiry_after_max_attempts_becomes_dead(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     database = Database(f"sqlite:///{tmp_path / 'lease-dead.db'}")
     database.create_all()
     repository = BotRepository(database)
     state = repository.upsert_event_state(make_event_state())
-    repository.save_signal(make_signal_decision(), state, telegram_sent=False, delivery_payload="payload")
+    repository.save_signal(make_signal_decision(), state, telegram_sent=False, delivery_payload="payload", provenance=make_signal_provenance())
     now = datetime.now(timezone.utc)
 
     claimed = None
@@ -186,13 +187,13 @@ def test_delivery_lease_expiry_after_max_attempts_becomes_dead(tmp_path, make_ev
         assert session.scalars(select(TelegramDeliveryOutboxModel)).one().status == "DEAD"
 
 
-def test_delivery_success_updates_source_and_outbox_atomically(tmp_path, make_event_state, make_signal_decision) -> None:
+def test_delivery_success_updates_source_and_outbox_atomically(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     database = Database(f"sqlite:///{tmp_path / 'outbox-success.db'}")
     database.create_all()
     repository = BotRepository(database)
     state = repository.upsert_event_state(make_event_state())
     signal = repository.save_signal(
-        make_signal_decision(), state, telegram_sent=False, delivery_payload="payload"
+        make_signal_decision(), state, telegram_sent=False, delivery_payload="payload", provenance=make_signal_provenance()
     )
     claimed = repository.claim_due_deliveries(datetime.now(timezone.utc), limit=1, lease_seconds=30)
 
@@ -203,12 +204,12 @@ def test_delivery_success_updates_source_and_outbox_atomically(tmp_path, make_ev
         assert session.scalars(select(TelegramDeliveryOutboxModel)).one().status == "SENT"
 
 
-def test_legacy_unsent_signals_are_not_auto_enqueued(tmp_path, make_event_state, make_signal_decision) -> None:
+def test_legacy_unsent_signals_are_not_auto_enqueued(tmp_path, make_event_state, make_signal_decision, make_signal_provenance) -> None:
     database = Database(f"sqlite:///{tmp_path / 'legacy.db'}")
     database.create_all()
     repository = BotRepository(database)
     state = repository.upsert_event_state(make_event_state())
-    repository.save_signal(make_signal_decision(model_version=None), state, telegram_sent=False)
+    repository.save_signal(make_signal_decision(model_version=None), state, telegram_sent=False, provenance=make_signal_provenance())
 
     assert repository.count_legacy_unsent_signals() == 1
     assert repository.claim_due_deliveries(datetime.now(timezone.utc), limit=10, lease_seconds=30) == []
