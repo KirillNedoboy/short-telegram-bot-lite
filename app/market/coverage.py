@@ -31,6 +31,27 @@ class ScanUniverseTelemetry:
         return universe_fingerprint(self.eligible_symbols)
 
 
+def build_coverage_rows(*, rotation_id: str, observed_at: datetime, exchange_symbols: Iterable[str], eligible_symbols: Iterable[str], excluded: Iterable[tuple[str, str]], scheduled_symbols: Iterable[str], symbol_results: Iterable[dict]) -> list[dict]:
+    exchange = sorted({str(x).upper() for x in exchange_symbols})
+    eligible = {str(x).upper() for x in eligible_symbols}
+    scheduled = {str(x).upper() for x in scheduled_symbols}
+    exclusions = {str(symbol).upper(): reason for symbol, reason in excluded}
+    results = {str(row.get("symbol", "")).upper(): row for row in symbol_results}
+    rows = []
+    for symbol in exchange:
+        row = results.get(symbol, {})
+        status = str(row.get("terminal_status") or ("EXCLUDED" if symbol not in eligible else "SCAN_SKIPPED"))
+        rows.append({
+            "rotation_id": rotation_id, "observed_at": observed_at, "symbol": symbol,
+            "exchange_present": True, "eligible": symbol in eligible,
+            "exclusion_reason": exclusions.get(symbol), "scheduled": symbol in scheduled,
+            "scanned": status in {"SCANNED_OK", "SCAN_FAILED", "SCAN_SKIPPED"},
+            "scan_status": status,
+            "evidence_json": {"reason_code": row.get("reason_code") or exclusions.get(symbol)},
+        })
+    return rows
+
+
 TERMINAL_STATUSES = {"EXCLUDED", "SCANNED_OK", "SCAN_FAILED", "SCAN_SKIPPED"}
 ROTATION_STATUSES = {"OPEN", "COMPLETED", "INCOMPLETE", "ABORTED_RESTART", "FAILED"}
 

@@ -131,6 +131,8 @@ class Database:
                     if column_name in existing:
                         continue
                     connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl_type}")
+            connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_root_shadow_symbol_seen ON root_detector_shadow_candidates(symbol, first_seen_at)")
+            connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_root_shadow_status ON root_detector_shadow_candidates(outcome_status, live_root_created)")
             if "strategy_observations" in columns_by_table:
                 connection.exec_driver_sql(
                     "CREATE INDEX IF NOT EXISTS ix_strategy_observations_outcome_next_attempt_at "

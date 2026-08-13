@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from app.domain import EventState, EventStatus, SignalDecision, SignalOutcome, SignalProvenanceInput, SignalRecord, WatchCandidateRecord
 from app.market.coverage import coverage_percent, universe_fingerprint
+from app.market.coverage import build_coverage_rows
 from app.observability.strategy_observations import ObservationWriteResult, ObservationWriteStatus, StrategyObservation
 from app.storage.db import Database
 from app.storage.models import (
@@ -33,6 +34,8 @@ from app.storage.models import (
     MarketScanCycleModel,
     MarketScanRotationModel,
     MarketScanSymbolResultModel,
+    MarketCoverageLedgerModel,
+    RootDetectorShadowCandidateModel,
     SignalModel,
     SignalOutcomeModel,
     SignalProvenanceModel,
@@ -140,6 +143,12 @@ class BotRepository:
                             rotation_id=rotation.rotation_id, symbol=symbol, terminal_status="EXCLUDED", reason_code=reason,
                             completed_at=now, runtime_instance_id=runtime_id, details_json={},
                         ))
+                for coverage in build_coverage_rows(
+                    rotation_id=rotation.rotation_id, observed_at=now,
+                    exchange_symbols=exchange, eligible_symbols=eligible,
+                    excluded=excluded, scheduled_symbols=scheduled, symbol_results=symbol_results,
+                ):
+                    session.add(MarketCoverageLedgerModel(**coverage))
                 for symbol in scheduled:
                     row = result_map.get(symbol, {"terminal_status": "SCAN_SKIPPED", "reason_code": "NOT_SCHEDULED_IN_BATCH"})
                     existing = session.scalar(select(MarketScanSymbolResultModel.id).where(MarketScanSymbolResultModel.rotation_id == rotation.rotation_id, MarketScanSymbolResultModel.symbol == symbol))
@@ -198,6 +207,100 @@ class BotRepository:
         except Exception:
             logger.exception("market coverage telemetry write failed")
             return None
+
+    def prepare_market_scan_rotation(self, *, rotation_started_at: datetime, exchange_symbols: list[str], eligible_symbols: list[str]) -> str | None:
+        """Open or reuse the exact rotation that the current scan will record."""
+        try:
+            runtime_id = getattr(self, "_runtime_instance_id", "unknown")
+            model_version = getattr(self, "_model_version", "unknown")
+            config_fingerprint = getattr(self, "_config_fingerprint", "unknown")
+            exchange = sorted({str(s).upper() for s in exchange_symbols})
+            eligible = sorted({str(s).upper() for s in eligible_symbols})
+            exchange_fp = universe_fingerprint(exchange)
+            eligible_fp = universe_fingerprint(eligible)
+            with self._db.session() as session:
+                rotation = session.scalars(select(MarketScanRotationModel).where(MarketScanRotationModel.status == "OPEN").order_by(MarketScanRotationModel.rotation_started_at.desc())).first()
+                if rotation is not None and rotation.runtime_instance_id == runtime_id and rotation.exchange_universe_fingerprint == exchange_fp and rotation.eligible_universe_fingerprint == eligible_fp:
+                    return rotation.rotation_id
+                if rotation is not None:
+                    rotation.status = "ABORTED_RESTART" if rotation.runtime_instance_id != runtime_id else "INCOMPLETE"
+                    rotation.rotation_completed_at = rotation_started_at
+                rotation = MarketScanRotationModel(
+                    rotation_id=uuid.uuid4().hex, runtime_instance_id=runtime_id, model_version=model_version,
+                    config_fingerprint=config_fingerprint, rotation_started_at=rotation_started_at, status="OPEN",
+                    exchange_universe_size=len(exchange), eligible_universe_size=len(eligible),
+                    exchange_universe_fingerprint=exchange_fp, eligible_universe_fingerprint=eligible_fp,
+                    details_json={"excluded_reason_codes": {}},
+                )
+                session.add(rotation)
+                session.flush()
+                return rotation.rotation_id
+        except Exception:
+            logger.exception("market coverage rotation preparation failed")
+            return None
+
+    def record_root_detector_shadow_candidate(self, candidate: dict[str, Any]) -> bool:
+        """Persist bounded shadow telemetry without allowing failures into live flow."""
+        try:
+            with self._db.session() as session:
+                if session.scalar(select(RootDetectorShadowCandidateModel.id).where(RootDetectorShadowCandidateModel.candidate_id == candidate["candidate_id"])) is not None:
+                    return False
+                session.add(RootDetectorShadowCandidateModel(**candidate))
+            return True
+        except Exception:
+            logger.exception("root detector shadow telemetry write failed")
+            return False
+
+    def append_root_detector_shadow_observation(self, candidate_id: str, observation: dict[str, Any]) -> bool:
+        try:
+            with self._db.session() as session:
+                row = session.scalar(select(RootDetectorShadowCandidateModel).where(RootDetectorShadowCandidateModel.candidate_id == candidate_id))
+                if row is None:
+                    return False
+                rows = list(row.observations_json or [])
+                if len(rows) < 96:
+                    rows.append(_json_ready(observation))
+                    row.observations_json = rows
+            return True
+        except Exception:
+            logger.exception("root detector shadow observation write failed")
+            return False
+
+    def mature_root_detector_shadow_candidate(self, candidate_id: str, outcome: dict[str, Any]) -> bool:
+        try:
+            with self._db.session() as session:
+                row = session.scalar(select(RootDetectorShadowCandidateModel).where(RootDetectorShadowCandidateModel.candidate_id == candidate_id))
+                if row is None:
+                    return False
+                row.outcome_json = _json_ready(outcome)
+                row.outcome_status = outcome.get("outcome_status")
+                row.outcome_mfe_pct = outcome.get("mfe_pct")
+                row.outcome_mae_pct = outcome.get("mae_pct")
+                row.new_high_after_candidate = outcome.get("new_high_after_candidate")
+                row.coverage_end_at = outcome.get("coverage_end_at")
+            return True
+        except Exception:
+            logger.exception("root detector shadow outcome write failed")
+            return False
+
+    def link_root_detector_shadow_candidate(self, candidate_id: str, *, root_event_id: str, root_created_at: datetime, peak_time: datetime | None = None) -> bool:
+        try:
+            with self._db.session() as session:
+                row = session.scalar(select(RootDetectorShadowCandidateModel).where(RootDetectorShadowCandidateModel.candidate_id == candidate_id))
+                if row is None:
+                    return False
+                row.live_root_created = True
+                row.live_root_event_id = root_event_id
+                row.root_created_at = root_created_at
+                created = _ensure_utc(root_created_at)
+                first_seen = _ensure_utc(row.first_seen_at)
+                peak = _ensure_utc(peak_time)
+                row.candidate_to_root_latency = max(0.0, (created - first_seen).total_seconds()) if created and first_seen else None
+                row.peak_to_root_latency = max(0.0, (created - peak).total_seconds()) if created and peak else None
+            return True
+        except Exception:
+            logger.exception("root detector shadow linkage write failed")
+            return False
 
     def latest_market_coverage(self) -> dict[str, Any] | None:
         """Return the latest persisted rotation aggregate for read-only ops."""

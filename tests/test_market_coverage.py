@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.market.coverage import coverage_percent, universe_fingerprint
 from app.storage.db import Database
-from app.storage.models import MarketScanRotationModel, MarketScanSymbolResultModel
+from app.storage.models import MarketCoverageLedgerModel, MarketScanRotationModel, MarketScanSymbolResultModel
 from app.storage.repository import BotRepository
 
 
@@ -62,3 +62,17 @@ def test_five_batches_complete_rotation_and_failed_is_counted_once(tmp_path):
 def test_coverage_percent_is_bounded():
     assert coverage_percent(600, 500) == 100.0
     assert coverage_percent(0, 0) is None
+
+
+def test_coverage_ledger_is_append_only_per_rotation_and_symbol(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'coverage-ledger.sqlite'}")
+    db.create_all()
+    repo = BotRepository(db)
+    repo.set_runtime_metadata(runtime_instance_id="runtime-1", config_fingerprint="c" * 64)
+    result = _record(repo, ["AUSDT"], ["AUSDT"], [{"symbol": "AUSDT", "terminal_status": "SCANNED_OK", "reason_code": "SCANNED_OK"}])
+    assert result["rotation_id"]
+    with db.session() as session:
+        rows = session.query(MarketCoverageLedgerModel).all()
+        assert len(rows) == 2
+        assert {row.symbol for row in rows} == {"AUSDT", "EXCLUDEDUSDT"}
+        assert session.query(MarketCoverageLedgerModel).filter_by(symbol="EXCLUDEDUSDT").one().exclusion_reason == "LIQUIDITY_FILTER"

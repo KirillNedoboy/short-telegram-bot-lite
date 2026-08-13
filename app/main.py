@@ -25,6 +25,7 @@ from app.infra.request_scheduler import RequestScheduler
 from app.infra.runtime_metadata import resolve_code_version
 from app.logger import configure_logging
 from app.market.bybit_client import BybitClient
+from app.market.candles import complete_5m_ohlcv
 from app.market.scanner import MarketScanner
 from app.notifications.telegram import TelegramNotifier
 from app.notifications.throttling import ErrorThrottler
@@ -35,6 +36,7 @@ from app.observability.strategy_observations import (
     build_observation_evidence,
     make_observation_idempotency_key,
 )
+from app.observability.root_detector_shadow import ShadowCandidateInput, candidate_episode_key, evaluate_shadow_outcome, should_create_shadow_candidate
 from app.outcomes.tracker import OutcomeTracker
 from app.signals.climax import (
     ClimaxEvaluation,
@@ -142,6 +144,7 @@ class ShortSignalBot:
         self._fast_monitor_poll_sequence = 0
         self._fast_monitor_task: asyncio.Task[None] | None = None
         self._fast_monitor_running = False
+        self._shadow_rotation_id = "unknown"
 
         if repository is None:
             database = Database(config.db_url)
@@ -300,6 +303,7 @@ class ShortSignalBot:
     async def run_cycle(self) -> list[SignalDecision]:
         self._health.on_cycle_start()
         cycle_started_at = datetime.now(timezone.utc)
+        self._shadow_rotation_id = "unknown"
         self._watch_sent_in_cycle = 0
         decisions: list[SignalDecision] = []
         symbol_results: list[dict[str, object]] = []
@@ -309,6 +313,15 @@ class ShortSignalBot:
             await self._drain_delivery_outbox(limit=5)
             active_states = self._state_store.load_active()
             snapshots = await self._scanner.fetch_market_snapshots()
+            prepare_rotation = getattr(self._repository, "prepare_market_scan_rotation", None)
+            if prepare_rotation is not None:
+                telemetry = getattr(self._scanner, "last_universe_telemetry", None)
+                if telemetry is not None:
+                    self._shadow_rotation_id = prepare_rotation(
+                        rotation_started_at=cycle_started_at,
+                        exchange_symbols=list(telemetry.exchange_symbols),
+                        eligible_symbols=list(telemetry.eligible_symbols),
+                    ) or "unknown"
             shortlist = self._scanner.shortlist(snapshots)
             symbols = [snapshot.symbol for snapshot in shortlist]
             seen_symbols = set(symbols)
@@ -343,7 +356,7 @@ class ShortSignalBot:
             universe = getattr(self._scanner, "last_universe_telemetry", None)
             record_coverage = getattr(self._repository, "record_market_scan_cycle", None)
             if universe is not None and record_coverage is not None:
-                record_coverage(
+                coverage_result = record_coverage(
                     cycle_started_at=cycle_started_at,
                     cycle_completed_at=datetime.now(timezone.utc),
                     exchange_symbols=list(universe.exchange_symbols),
@@ -354,6 +367,11 @@ class ShortSignalBot:
                     candidate_symbols=len(decisions),
                     evaluated_symbols=len(symbol_results),
                 )
+                if coverage_result is None:
+                    await self._handle_error(
+                        "market-coverage-telemetry",
+                        RuntimeError("coverage ledger write returned no result"),
+                    )
             self._logger.info(
                 "Cycle complete | shortlist=%s symbols=%s signals=%s outcomes=%s",
                 len(shortlist),
@@ -1303,11 +1321,33 @@ class ShortSignalBot:
             market_asof=market_asof,
         )
         now = features.asof
+        shadow_candidate_id = self._observe_root_detector_shadow(features, state, now)
+        if shadow_candidate_id and state is not None and state.event_id:
+            self._repository.link_root_detector_shadow_candidate(
+                shadow_candidate_id, root_event_id=state.event_id,
+                root_created_at=state.event_start_time or now, peak_time=state.event_high_time,
+            )
+        if shadow_candidate_id:
+            try:
+                shadow_frame = complete_5m_ohlcv(frame_1m, now)
+                outcome = evaluate_shadow_outcome(
+                    observed_at=now, entry_price=features.price,
+                    event_high=features.event_high if hasattr(features, "event_high") else (state.event_high if state else None),
+                    frame_5m=shadow_frame, market_asof=now,
+                )
+                self._repository.mature_root_detector_shadow_candidate(shadow_candidate_id, outcome)
+            except Exception:
+                self._logger.exception("root detector shadow outcome failed symbol=%s", features.symbol)
 
         if state is None or state.state in {EventStatus.IDLE, EventStatus.EXPIRED}:
             new_state = self._pump_detector.build_event(symbol, frame_1m, features, now)
             if new_state is None:
                 return None, new_state
+            if shadow_candidate_id:
+                self._repository.link_root_detector_shadow_candidate(
+                    shadow_candidate_id, root_event_id=new_state.event_id,
+                    root_created_at=now, peak_time=new_state.event_high_time,
+                )
             if self._config.climax_short_enabled:
                 self._track_climax_candidate(new_state, now)
                 liquidity = await self._fetch_optional_liquidity(symbol, features.price)
@@ -1430,6 +1470,40 @@ class ShortSignalBot:
             self._logger.warning("Telegram delivery pending/retry | signal_id=%s", record.id)
         state = self._pullback_tracker.mark_signal_sent(state, signal_id=record.id, when=now)
         return decision, state
+
+    def _observe_root_detector_shadow(self, features: SymbolFeatures, state: EventState | None, now: datetime) -> str | None:
+        """Observe early acceleration only; this function cannot affect live decisions."""
+        high = float(state.event_high if state and state.event_high else max(features.last_high, features.price))
+        high_time = state.event_high_time if state and state.event_high_time else (features.last_high_time or now)
+        candidate = ShadowCandidateInput(
+            symbol=features.symbol, first_seen_at=now, rotation_id=self._shadow_rotation_id,
+            price=features.price, event_high=high, high_time=high_time,
+            pump_5m=features.ret_5m, pump_15m=features.ret_15m, pump_1h=features.ret_1h, pump_4h=features.ret_4h,
+            volume_ratio=None, volume_z=features.vol_zscore_30m,
+            oi_5m=features.oi_change_pct, oi_15m=features.oi_change_15m, oi_1h=features.oi_change_1h,
+            distance_from_high=features.distance_to_event_high_pct,
+            conditions={"pump_5m": "PASS" if features.ret_5m >= 2 else "FAIL", "pump_15m": "PASS" if features.ret_15m >= 4 else "FAIL", "pump_1h": "PASS" if features.ret_1h >= 7 else "FAIL", "pump_4h": "PASS" if features.ret_4h >= 10 else "FAIL", "volume_z": "PASS" if features.vol_zscore_30m > 0 else "MISSING"},
+        )
+        if not should_create_shadow_candidate(candidate):
+            return None
+        candidate_id = candidate_episode_key(candidate)
+        self._repository.record_root_detector_shadow_candidate({
+            "candidate_id": candidate_id, "symbol": candidate.symbol, "first_seen_at": candidate.first_seen_at,
+            "rotation_id": candidate.rotation_id, "price": candidate.price, "event_high": candidate.event_high,
+            "high_time": candidate.high_time, "pump_5m": candidate.pump_5m, "pump_15m": candidate.pump_15m,
+            "pump_1h": candidate.pump_1h, "pump_4h": candidate.pump_4h, "volume_ratio": candidate.volume_ratio,
+            "volume_z": candidate.volume_z, "oi_5m": candidate.oi_5m, "oi_15m": candidate.oi_15m,
+            "oi_1h": candidate.oi_1h, "distance_from_high": candidate.distance_from_high,
+            "conditions_json": candidate.conditions or {}, "live_root_created": False,
+            "code_version": self._code_version, "config_hash": self._config_fingerprint,
+            "runtime_instance_id": self._runtime_instance_id, "runtime_started_at": self._runtime_started_at,
+            "observations_json": [], "outcome_json": {},
+        })
+        self._repository.append_root_detector_shadow_observation(candidate_id, {
+            "observed_at": now, "price": candidate.price, "event_high": candidate.event_high,
+            "conditions": candidate.conditions or {}, "code_version": self._code_version,
+        })
+        return candidate_id
 
     async def _maybe_emit_early_pump_watch(
         self,
