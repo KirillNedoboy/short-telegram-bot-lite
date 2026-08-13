@@ -61,3 +61,18 @@ def test_shadow_outcome_uses_only_closed_candles_and_censors_unmatured_horizons(
     assert result["horizons"]["30m"]["price"] is None
     assert result["mfe_pct"] == 5.0
     assert result["outcome_status"] == "CENSORED"
+
+
+def test_shadow_outcome_handles_timestamp_index_from_scanner_frame():
+    observed = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    frame = pd.DataFrame([
+        {"timestamp": datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc), "high": 101, "low": 99, "close": 100},
+    ]).set_index("timestamp")
+    result = evaluate_shadow_outcome(
+        observed_at=observed,
+        entry_price=100,
+        event_high=100,
+        frame_5m=frame,
+        market_asof=datetime(2026, 1, 1, 0, 6, tzinfo=timezone.utc),
+    )
+    assert result["horizons"]["15m"]["price"] is None

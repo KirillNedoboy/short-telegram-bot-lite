@@ -48,8 +48,11 @@ def evaluate_shadow_outcome(*, observed_at: datetime, entry_price: float, event_
     observed = _utc(observed_at)
     asof = _utc(market_asof)
     rows = frame_5m.copy()
+    if "timestamp" not in rows.columns and rows.index.name == "timestamp":
+        rows = rows.reset_index()
     rows["timestamp"] = pd.to_datetime(rows["timestamp"], utc=True)
-    rows = rows[(rows["timestamp"] > observed) & (rows["timestamp"] <= asof)].sort_values("timestamp")
+    rows = rows[(rows["timestamp"] > observed) & (rows["timestamp"] <= asof)]
+    rows = rows.reset_index(drop=True).sort_values("timestamp")
     horizons = {}
     for label, minutes in (("15m", 15), ("30m", 30), ("1h", 60), ("4h", 240), ("12h", 720), ("24h", 1440)):
         target = observed + timedelta(minutes=minutes)
