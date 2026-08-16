@@ -52,7 +52,7 @@ def main() -> None:
         "scanned": distinct_count("scanned = 1"),
         "exclusion_reasons": {str(row["exclusion_reason"]): row["n"] for row in coverage if row["exclusion_reason"]},
         "scheduled_scanned": coverage,
-        "unexpected_result_present": int(connection.execute("SELECT COUNT(*) FROM market_coverage_ledger WHERE unexpected_result_present = 1").fetchone()[0]) if _has_column(connection, "market_coverage_ledger", "unexpected_result_present") else None,
+        "unexpected_result_present": int(connection.execute("SELECT COUNT(*) FROM market_coverage_ledger WHERE unexpected_result_present = 1").fetchone()[0]) if _has_column("market_coverage_ledger", "unexpected_result_present") else None,
         "shadow_candidates": candidates,
         "candidate_count": len(candidates),
         "episode_count": episode_count,
