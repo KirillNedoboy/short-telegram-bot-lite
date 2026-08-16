@@ -31,18 +31,11 @@ def main() -> None:
     episode_outcomes = []
     if _has_table("root_detector_shadow_episode_outcomes"):
         episode_outcomes = [dict(row) for row in connection.execute("SELECT * FROM root_detector_shadow_episode_outcomes ORDER BY episode_id")]
+    canonical_maturity = {status: sum(1 for row in episode_outcomes if row.get("outcome_status") == status) for status in {row.get("outcome_status") for row in episode_outcomes}}
+    raw_maturity = {status: sum(1 for row in candidates if row["outcome_status"] == status) for status in {row["outcome_status"] for row in candidates}}
     horizon_summary = {}
     for label in ("15m", "30m", "1h", "4h", "12h", "24h"):
-        values = []
-        for row in candidates:
-            try:
-                payload = row.get("outcome_json") or {}
-                payload = json.loads(payload) if isinstance(payload, str) else payload
-                price = payload.get("horizons", {}).get(label, {}).get("short_return_pct")
-                if price is not None:
-                    values.append(float(price))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
+        values = [float(row[f"return_{label}"]) for row in episode_outcomes if row.get(f"return_{label}") is not None]
         horizon_summary[label] = {"count": len(values), "mean_short_return_pct": sum(values) / len(values) if values else None}
     latency_values = [float(row["candidate_to_root_latency"]) for row in candidates if row["candidate_to_root_latency"] is not None]
     print(json.dumps({
@@ -62,7 +55,8 @@ def main() -> None:
         "live_root_linked": sum(1 for row in candidates if row["live_root_created"]),
         "without_root": sum(1 for row in candidates if not row["live_root_created"]),
         "latency_seconds": {"count": len(latency_values), "min": min(latency_values) if latency_values else None, "max": max(latency_values) if latency_values else None},
-        "outcome_maturity": {status: sum(1 for row in candidates if row["outcome_status"] == status) for status in {row["outcome_status"] for row in candidates}},
+        "outcome_maturity": canonical_maturity or raw_maturity,
+        "raw_outcome_maturity": raw_maturity,
         "horizon_summary": horizon_summary,
     }, ensure_ascii=False, default=str, indent=2))
 
