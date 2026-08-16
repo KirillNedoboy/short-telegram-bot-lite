@@ -539,6 +539,7 @@ class BotRepository:
             raise ValueError("WATCH decisions must be stored via save_watch_candidate")
         features = decision.features_snapshot
         with self._db.session() as session:
+            decision_event_high = provenance.decision_event_high
             model = SignalModel(
                 symbol=decision.symbol,
                 signal_time=decision.signal_time,
@@ -549,7 +550,7 @@ class BotRepository:
                 short_zone_low=decision.short_zone_low,
                 short_zone_high=decision.short_zone_high,
                 event_id=decision.event_id,
-                event_high=event_state.event_high or decision.market_price,
+                event_high=decision_event_high or event_state.event_high or decision.market_price,
                 event_base_price=event_state.event_base_price or decision.market_price,
                 event_range_pct=event_state.event_range_pct or 0.0,
                 pullback_from_high_pct=_required_float(features.get("pullback_from_high_pct"), field_name="pullback_from_high_pct"),

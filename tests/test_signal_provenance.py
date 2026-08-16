@@ -70,6 +70,20 @@ def test_save_signal_persists_complete_baseline_provenance_atomically(tmp_path, 
     assert outbox.entity_id == signal.id
 
 
+def test_signal_serialization_uses_decision_time_event_high_snapshot(tmp_path, make_event_state, make_signal_decision) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'decision-snapshot.sqlite'}")
+    database.create_all()
+    repository = BotRepository(database)
+    state = repository.upsert_event_state(make_event_state(event_high=115.0))
+    provenance = replace(_baseline_provenance(), decision_entry_price=112.0, decision_event_high=114.0, decision_distance_from_high=((114.0 - 112.0) / 114.0) * 100)
+
+    signal = repository.save_signal(make_signal_decision(), state, telegram_sent=False, provenance=provenance)
+
+    with database.session() as session:
+        stored = session.get(__import__("app.storage.models", fromlist=["SignalModel"]).SignalModel, signal.id)
+    assert stored.event_high == 114.0
+
+
 def test_signal_provenance_is_one_row_per_signal(tmp_path, make_event_state, make_signal_decision) -> None:
     database = Database(f"sqlite:///{tmp_path / 'provenance-unique.sqlite'}")
     database.create_all()
