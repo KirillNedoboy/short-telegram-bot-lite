@@ -81,6 +81,12 @@ class Database:
                 ("outcome_next_attempt_at", "TIMESTAMP"),
                 ("outcome_attempt_count", "INTEGER DEFAULT 0"),
             ],
+            "signal_provenance": [
+                ("decision_entry_price", "FLOAT"),
+                ("decision_event_high", "FLOAT"),
+                ("decision_distance_from_high", "FLOAT"),
+                ("provenance_anomaly", "TEXT"),
+            ],
             "climax_evaluations": [
                 ("runtime_instance_id", "TEXT"),
                 ("root_event_id", "TEXT"),
@@ -123,6 +129,9 @@ class Database:
                 ("derivatives_reasons_json", "JSON"),
                 ("data_quality_warnings_json", "JSON"),
             ],
+            "market_coverage_ledger": [
+                ("unexpected_result_present", "BOOLEAN NOT NULL DEFAULT 0"),
+            ],
         }
         with self.engine.begin() as connection:
             for table_name, columns in additions.items():
@@ -133,6 +142,11 @@ class Database:
                     connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl_type}")
             connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_root_shadow_symbol_seen ON root_detector_shadow_candidates(symbol, first_seen_at)")
             connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_root_shadow_status ON root_detector_shadow_candidates(outcome_status, live_root_created)")
+            if "market_coverage_ledger" in columns_by_table:
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_market_coverage_unexpected_result "
+                    "ON market_coverage_ledger(unexpected_result_present)"
+                )
             if "strategy_observations" in columns_by_table:
                 connection.exec_driver_sql(
                     "CREATE INDEX IF NOT EXISTS ix_strategy_observations_outcome_next_attempt_at "

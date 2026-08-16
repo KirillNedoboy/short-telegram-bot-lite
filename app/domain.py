@@ -196,6 +196,10 @@ class SignalProvenanceInput:
     runtime_instance_id: str
     runtime_started_at: datetime
     decision_at: datetime
+    decision_entry_price: float | None = None
+    decision_event_high: float | None = None
+    decision_distance_from_high: float | None = None
+    provenance_anomaly: str | None = None
 
 
 @dataclass(slots=True)

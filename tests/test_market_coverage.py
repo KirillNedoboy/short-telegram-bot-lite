@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.market.coverage import coverage_percent, universe_fingerprint
+from app.market.coverage import build_coverage_rows, coverage_percent, universe_fingerprint
 from app.storage.db import Database
 from app.storage.models import MarketCoverageLedgerModel, MarketScanRotationModel, MarketScanSymbolResultModel
 from app.storage.repository import BotRepository
@@ -76,3 +76,14 @@ def test_coverage_ledger_is_append_only_per_rotation_and_symbol(tmp_path):
         assert len(rows) == 2
         assert {row.symbol for row in rows} == {"AUSDT", "EXCLUDEDUSDT"}
         assert session.query(MarketCoverageLedgerModel).filter_by(symbol="EXCLUDEDUSDT").one().exclusion_reason == "LIQUIDITY_FILTER"
+
+
+def test_excluded_result_remains_canonical_excluded_and_is_flagged():
+    rows = build_coverage_rows(
+        rotation_id="r1", observed_at=datetime.now(timezone.utc), exchange_symbols=["BADUSDT"],
+        eligible_symbols=[], excluded=[("BADUSDT", "LIQUIDITY_FILTER")], scheduled_symbols=[],
+        symbol_results=[{"symbol": "BADUSDT", "terminal_status": "SCANNED_OK", "reason_code": "SCANNED_OK"}],
+    )
+    assert rows[0]["scan_status"] == "EXCLUDED"
+    assert rows[0]["scanned"] is False
+    assert rows[0]["unexpected_result_present"] is True

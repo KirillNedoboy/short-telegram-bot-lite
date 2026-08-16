@@ -27,13 +27,13 @@ def test_coverage_row_created_deterministically_and_preserves_exclusion_reason()
             "rotation_id": "r1", "observed_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
             "symbol": "AAAUSDT", "exchange_present": True, "eligible": True,
             "exclusion_reason": None, "scheduled": True, "scanned": True,
-            "scan_status": "SCANNED_OK", "evidence_json": {"reason_code": "SCANNED_OK"},
+            "scan_status": "SCANNED_OK", "unexpected_result_present": False, "evidence_json": {"reason_code": "SCANNED_OK", "observed_terminal_status": None},
         },
         {
             "rotation_id": "r1", "observed_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
             "symbol": "BBBUSDT", "exchange_present": True, "eligible": False,
             "exclusion_reason": "LIQUIDITY_FILTER", "scheduled": False, "scanned": False,
-            "scan_status": "EXCLUDED", "evidence_json": {"reason_code": "LIQUIDITY_FILTER"},
+            "scan_status": "EXCLUDED", "unexpected_result_present": False, "evidence_json": {"reason_code": "LIQUIDITY_FILTER", "observed_terminal_status": None},
         },
     ]
 
@@ -60,7 +60,17 @@ def test_shadow_outcome_uses_only_closed_candles_and_censors_unmatured_horizons(
     assert result["horizons"]["15m"]["price"] == 96
     assert result["horizons"]["30m"]["price"] is None
     assert result["mfe_pct"] == 5.0
-    assert result["outcome_status"] == "CENSORED"
+    assert result["outcome_status"] == "PARTIAL"
+
+
+def test_shadow_outcome_marks_overdue_missing_candles_as_data_gap():
+    observed = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    result = evaluate_shadow_outcome(
+        observed_at=observed, entry_price=100, event_high=110,
+        frame_5m=pd.DataFrame(columns=["timestamp", "high", "low", "close"]),
+        market_asof=observed + timedelta(hours=2),
+    )
+    assert result["outcome_status"] == "DATA_GAP"
 
 
 def test_shadow_outcome_handles_timestamp_index_from_scanner_frame():

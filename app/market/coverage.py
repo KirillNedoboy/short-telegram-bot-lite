@@ -40,14 +40,19 @@ def build_coverage_rows(*, rotation_id: str, observed_at: datetime, exchange_sym
     rows = []
     for symbol in exchange:
         row = results.get(symbol, {})
-        status = str(row.get("terminal_status") or ("EXCLUDED" if symbol not in eligible else "SCAN_SKIPPED"))
+        excluded_symbol = symbol not in eligible
+        unexpected_result_present = excluded_symbol and bool(row)
+        # EXCLUDED is canonical. A stray scanner result is retained as evidence,
+        # but never allowed to contaminate the funnel's scanned state.
+        status = "EXCLUDED" if excluded_symbol else str(row.get("terminal_status") or "SCAN_SKIPPED")
         rows.append({
             "rotation_id": rotation_id, "observed_at": observed_at, "symbol": symbol,
-            "exchange_present": True, "eligible": symbol in eligible,
-            "exclusion_reason": exclusions.get(symbol), "scheduled": symbol in scheduled,
-            "scanned": status in {"SCANNED_OK", "SCAN_FAILED", "SCAN_SKIPPED"},
+            "exchange_present": True, "eligible": not excluded_symbol,
+            "exclusion_reason": exclusions.get(symbol), "scheduled": symbol in scheduled if not excluded_symbol else False,
+            "scanned": status in {"SCANNED_OK", "SCAN_FAILED", "SCAN_SKIPPED"} if not excluded_symbol else False,
             "scan_status": status,
-            "evidence_json": {"reason_code": row.get("reason_code") or exclusions.get(symbol)},
+            "unexpected_result_present": unexpected_result_present,
+            "evidence_json": {"reason_code": row.get("reason_code") or exclusions.get(symbol), "observed_terminal_status": row.get("terminal_status") if unexpected_result_present else None},
         })
     return rows
 

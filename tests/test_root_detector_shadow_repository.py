@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from app.storage.db import Database
-from app.storage.models import RootDetectorShadowCandidateModel, SignalModel, TelegramDeliveryOutboxModel
+from app.storage.models import RootDetectorShadowCandidateModel, RootDetectorShadowEpisodeModel, RootDetectorShadowObservationModel, RootDetectorShadowEpisodeRootLinkModel, SignalModel, TelegramDeliveryOutboxModel
 from app.storage.repository import BotRepository
 
 
@@ -33,3 +33,52 @@ def test_shadow_candidate_dedupe_linkage_and_outcome_do_not_create_signal_or_out
         assert row.candidate_to_root_latency == 60.0
         assert session.query(SignalModel).count() == 0
         assert session.query(TelegramDeliveryOutboxModel).count() == 0
+
+
+def test_episode_identity_merges_within_gap_and_reopens_after_gap(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'episodes.sqlite'}")
+    db.create_all()
+    repo = BotRepository(db)
+    first = _candidate()
+    first["candidate_id"] = "legacy-1"
+    episode_1 = repo.record_root_detector_shadow_episode_observation(first)
+    second = dict(first, candidate_id="legacy-2", first_seen_at=first["first_seen_at"].replace(minute=20), price=111.0)
+    episode_2 = repo.record_root_detector_shadow_episode_observation(second)
+    third = dict(first, candidate_id="legacy-3", first_seen_at=first["first_seen_at"].replace(minute=55), price=112.0)
+    episode_3 = repo.record_root_detector_shadow_episode_observation(third)
+    assert episode_1 == episode_2
+    assert episode_3 != episode_1
+    with db.session() as session:
+        assert session.query(RootDetectorShadowEpisodeModel).count() == 2
+        assert session.query(RootDetectorShadowObservationModel).count() == 3
+        assert session.query(RootDetectorShadowEpisodeModel).filter_by(episode_status="CLOSED").count() == 1
+
+
+def test_episode_root_links_are_append_only_and_allow_revisions(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'episode-links.sqlite'}")
+    db.create_all()
+    repo = BotRepository(db)
+    episode_id = repo.record_root_detector_shadow_episode_observation(_candidate())
+    assert episode_id
+    when = datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc)
+    assert repo.link_root_detector_shadow_episode(episode_id, root_event_id="root-1", linked_at=when)
+    assert repo.link_root_detector_shadow_episode(episode_id, root_event_id="root-2", linked_at=when, link_type="REVISION", event_revision=2)
+    with db.session() as session:
+        assert session.query(RootDetectorShadowEpisodeRootLinkModel).count() == 2
+
+
+def test_episode_outcome_scheduler_is_bounded_and_horizon_fill_is_idempotent(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'episode-outcomes.sqlite'}")
+    db.create_all()
+    repo = BotRepository(db)
+    episode_id = repo.record_root_detector_shadow_episode_observation(_candidate())
+    due = repo.list_root_detector_shadow_episode_outcomes_due(due_at=datetime(2026, 1, 1, 0, 20, tzinfo=timezone.utc), limit=1)
+    assert [row["episode_id"] for row in due] == [episode_id]
+    outcome = {"outcome_status": "PARTIAL", "outcome_method_version": "ROOT_SHADOW_OUTCOME_V2", "horizons": {"15m": {"short_return_pct": 2.0}}}
+    assert repo.record_root_detector_shadow_episode_outcome_attempt(episode_id, outcome=outcome, next_due_at=None, computed_at=datetime(2026, 1, 1, 0, 20, tzinfo=timezone.utc))
+    assert repo.record_root_detector_shadow_episode_outcome_attempt(episode_id, outcome={"outcome_status": "MATURE", "horizons": {"15m": {"short_return_pct": 9.0}}}, next_due_at=None, computed_at=datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc))
+    from app.storage.models import RootDetectorShadowEpisodeOutcomeModel
+    with db.session() as session:
+        row = session.get(RootDetectorShadowEpisodeOutcomeModel, episode_id)
+        assert row.return_15m == 2.0
+        assert row.outcome_attempt_count == 2

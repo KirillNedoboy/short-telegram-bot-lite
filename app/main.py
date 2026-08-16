@@ -53,6 +53,20 @@ from app.storage.db import Database
 from app.storage.repository import BotRepository
 
 
+def _provenance_anomaly(decision: SignalDecision) -> str | None:
+    """Validate the decision-time snapshot without vetoing live delivery."""
+    if decision.strategy_subtype not in {"VOLUME_CLIMAX_UNWIND", "LOW_VOLUME_EXTENSION_FAILURE"}:
+        return None
+    high = decision.strategy_metadata.get("event_high")
+    if high is None or decision.market_price <= 0 or float(high) < decision.market_price:
+        return "PROVENANCE_INVARIANT_FAILED"
+    computed = (float(high) - decision.market_price) / float(high) * 100.0
+    stored = decision.strategy_metadata.get("entry_distance_below_high_pct")
+    if stored is not None and abs(float(stored) - computed) > 0.05:
+        return "PROVENANCE_INVARIANT_FAILED"
+    return None
+
+
 def _public_config_fingerprint(config: AppConfig) -> str:
     """Hash only non-secret, behavior-relevant config values."""
     values = config.model_dump(mode="json")
@@ -1262,6 +1276,10 @@ class ShortSignalBot:
             runtime_instance_id=self._runtime_instance_id,
             runtime_started_at=self._runtime_started_at,
             decision_at=decision.signal_time,
+            decision_entry_price=decision.market_price,
+            decision_event_high=float(decision.strategy_metadata.get("event_high")) if decision.strategy_metadata.get("event_high") is not None else None,
+            decision_distance_from_high=float(decision.strategy_metadata.get("entry_distance_below_high_pct")) if decision.strategy_metadata.get("entry_distance_below_high_pct") is not None else None,
+            provenance_anomaly=_provenance_anomaly(decision),
         )
 
     @staticmethod
@@ -1336,6 +1354,12 @@ class ShortSignalBot:
                     frame_5m=shadow_frame, market_asof=now,
                 )
                 self._repository.mature_root_detector_shadow_candidate(shadow_candidate_id, outcome)
+                self._repository.record_root_detector_shadow_episode_outcome_attempt(
+                    shadow_candidate_id,
+                    outcome=outcome,
+                    next_due_at=None if outcome.get("outcome_status") == "MATURE" else now + timedelta(minutes=15),
+                    computed_at=now,
+                )
             except Exception:
                 self._logger.exception("root detector shadow outcome failed symbol=%s", features.symbol)
 
@@ -1486,9 +1510,8 @@ class ShortSignalBot:
         )
         if not should_create_shadow_candidate(candidate):
             return None
-        candidate_id = candidate_episode_key(candidate)
-        self._repository.record_root_detector_shadow_candidate({
-            "candidate_id": candidate_id, "symbol": candidate.symbol, "first_seen_at": candidate.first_seen_at,
+        candidate_payload = {
+            "candidate_id": "pending", "symbol": candidate.symbol, "first_seen_at": candidate.first_seen_at,
             "rotation_id": candidate.rotation_id, "price": candidate.price, "event_high": candidate.event_high,
             "high_time": candidate.high_time, "pump_5m": candidate.pump_5m, "pump_15m": candidate.pump_15m,
             "pump_1h": candidate.pump_1h, "pump_4h": candidate.pump_4h, "volume_ratio": candidate.volume_ratio,
@@ -1498,7 +1521,12 @@ class ShortSignalBot:
             "code_version": self._code_version, "config_hash": self._config_fingerprint,
             "runtime_instance_id": self._runtime_instance_id, "runtime_started_at": self._runtime_started_at,
             "observations_json": [], "outcome_json": {},
-        })
+        }
+        candidate_id = self._repository.record_root_detector_shadow_episode_observation(candidate_payload)
+        if not candidate_id:
+            return None
+        candidate_payload["candidate_id"] = candidate_id
+        self._repository.record_root_detector_shadow_candidate(candidate_payload)
         self._repository.append_root_detector_shadow_observation(candidate_id, {
             "observed_at": now, "price": candidate.price, "event_high": candidate.event_high,
             "conditions": candidate.conditions or {}, "code_version": self._code_version,

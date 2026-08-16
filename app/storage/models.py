@@ -92,6 +92,10 @@ class SignalProvenanceModel(Base):
     runtime_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     decision_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     signal_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    decision_entry_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    decision_event_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    decision_distance_from_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    provenance_anomaly: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 class SignalOutcomeModel(Base):
@@ -586,6 +590,7 @@ class MarketCoverageLedgerModel(Base):
     scanned: Mapped[bool] = mapped_column(Boolean)
     scan_status: Mapped[str] = mapped_column(String(32), index=True)
     evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    unexpected_result_present: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 class RootDetectorShadowCandidateModel(Base):
@@ -627,3 +632,102 @@ class RootDetectorShadowCandidateModel(Base):
     outcome_mae_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     new_high_after_candidate: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     coverage_end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RootDetectorShadowEpisodeModel(Base):
+    __tablename__ = "root_detector_shadow_episodes"
+    __table_args__ = (Index("ix_root_shadow_episode_symbol_last_trigger", "symbol", "last_trigger_at"),)
+
+    episode_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_trigger_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    episode_status: Mapped[str] = mapped_column(String(16), index=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    episode_mapping_version: Mapped[str] = mapped_column(String(32))
+    code_version: Mapped[str] = mapped_column(String(64))
+    runtime_instance_id: Mapped[str] = mapped_column(String(64), index=True)
+    runtime_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class RootDetectorShadowObservationModel(Base):
+    __tablename__ = "root_detector_shadow_observations"
+    __table_args__ = (Index("ix_root_shadow_observation_episode_time", "episode_id", "observed_at"),)
+
+    observation_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    episode_id: Mapped[str] = mapped_column(String(64), index=True)
+    legacy_candidate_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    price: Mapped[float] = mapped_column(Float)
+    event_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    high_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pump_5m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pump_15m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pump_1h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pump_4h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volume_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volume_z: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oi_5m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oi_15m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oi_1h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    distance_from_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    conditions_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    code_version: Mapped[str] = mapped_column(String(64))
+    runtime_instance_id: Mapped[str] = mapped_column(String(64))
+    runtime_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class RootDetectorShadowEpisodeOutcomeModel(Base):
+    __tablename__ = "root_detector_shadow_episode_outcomes"
+    __table_args__ = (Index("ix_root_shadow_episode_outcome_due", "outcome_status", "outcome_next_due_at"),)
+
+    episode_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    outcome_status: Mapped[str] = mapped_column(String(32), index=True)
+    return_15m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_30m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_1h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_4h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_12h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_24h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_48h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe_1h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae_1h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe_4h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae_4h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe_12h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae_12h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mfe_24h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mae_24h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_high_after_episode: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    coverage_end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_code_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    outcome_method_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    outcome_computed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_next_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    outcome_last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    outcome_last_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    outcome_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RootDetectorShadowEpisodeRootLinkModel(Base):
+    __tablename__ = "root_detector_shadow_episode_root_links"
+    __table_args__ = (UniqueConstraint("episode_id", "root_event_id", "link_type", name="uq_root_shadow_episode_root_link"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    episode_id: Mapped[str] = mapped_column(String(64), index=True)
+    root_event_id: Mapped[str] = mapped_column(String(128), index=True)
+    linked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    link_type: Mapped[str] = mapped_column(String(32))
+    event_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class RootDetectorShadowLegacyMappingModel(Base):
+    __tablename__ = "root_detector_shadow_legacy_mappings"
+    legacy_candidate_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    episode_id: Mapped[str] = mapped_column(String(64), index=True)
+    episode_mapping_version: Mapped[str] = mapped_column(String(32))
+    mapping_reason: Mapped[str] = mapped_column(String(128))
+    mapped_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)

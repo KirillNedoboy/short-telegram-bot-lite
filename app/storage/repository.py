@@ -36,6 +36,11 @@ from app.storage.models import (
     MarketScanSymbolResultModel,
     MarketCoverageLedgerModel,
     RootDetectorShadowCandidateModel,
+    RootDetectorShadowEpisodeModel,
+    RootDetectorShadowObservationModel,
+    RootDetectorShadowEpisodeOutcomeModel,
+    RootDetectorShadowEpisodeRootLinkModel,
+    RootDetectorShadowLegacyMappingModel,
     SignalModel,
     SignalOutcomeModel,
     SignalProvenanceModel,
@@ -251,6 +256,151 @@ class BotRepository:
             logger.exception("root detector shadow telemetry write failed")
             return False
 
+    def record_root_detector_shadow_episode_observation(self, candidate: dict[str, Any]) -> str | None:
+        """Open/continue a 30-minute gap episode and append one observation."""
+        try:
+            observed_at = _ensure_utc(candidate["first_seen_at"])
+            symbol = str(candidate["symbol"]).upper()
+            with self._db.session() as session:
+                episode = session.scalars(
+                    select(RootDetectorShadowEpisodeModel)
+                    .where(RootDetectorShadowEpisodeModel.symbol == symbol, RootDetectorShadowEpisodeModel.episode_status == "OPEN")
+                    .order_by(RootDetectorShadowEpisodeModel.last_trigger_at.desc())
+                ).first()
+                if episode is None or observed_at - _ensure_utc(episode.last_trigger_at) > timedelta(minutes=30):
+                    if episode is not None:
+                        episode.episode_status = "CLOSED"
+                        episode.closed_at = observed_at
+                    episode_id = uuid.uuid4().hex
+                    episode = RootDetectorShadowEpisodeModel(
+                        episode_id=episode_id, symbol=symbol, opened_at=observed_at,
+                        last_trigger_at=observed_at, last_high=candidate.get("event_high"), episode_status="OPEN",
+                        episode_mapping_version="ROOT_EPISODE_MAP_V1", code_version=candidate["code_version"],
+                        runtime_instance_id=candidate["runtime_instance_id"], runtime_started_at=candidate["runtime_started_at"],
+                    )
+                    session.add(episode)
+                else:
+                    episode_id = episode.episode_id
+                    episode.last_trigger_at = observed_at
+                    episode.last_high = candidate.get("event_high")
+                session.add(RootDetectorShadowObservationModel(
+                    episode_id=episode_id, legacy_candidate_id=candidate.get("candidate_id"), symbol=symbol,
+                    observed_at=observed_at, price=candidate["price"], event_high=candidate.get("event_high"),
+                    high_time=candidate.get("high_time"), pump_5m=candidate.get("pump_5m"), pump_15m=candidate.get("pump_15m"),
+                    pump_1h=candidate.get("pump_1h"), pump_4h=candidate.get("pump_4h"), volume_ratio=candidate.get("volume_ratio"),
+                    volume_z=candidate.get("volume_z"), oi_5m=candidate.get("oi_5m"), oi_15m=candidate.get("oi_15m"),
+                    oi_1h=candidate.get("oi_1h"), distance_from_high=candidate.get("distance_from_high"),
+                    conditions_json=candidate.get("conditions_json") or {}, code_version=candidate["code_version"],
+                    runtime_instance_id=candidate["runtime_instance_id"], runtime_started_at=candidate["runtime_started_at"],
+                ))
+                outcome = session.get(RootDetectorShadowEpisodeOutcomeModel, episode_id)
+                if outcome is None:
+                    session.add(RootDetectorShadowEpisodeOutcomeModel(
+                        episode_id=episode_id, outcome_status="CENSORED",
+                        outcome_next_due_at=observed_at + timedelta(minutes=15), outcome_attempt_count=0,
+                    ))
+            return episode_id
+        except Exception:
+            logger.exception("root detector shadow episode telemetry write failed")
+            return None
+
+    def link_root_detector_shadow_episode(self, episode_id: str, *, root_event_id: str, linked_at: datetime, link_type: str = "FIRST_ROOT", event_revision: int | None = None) -> bool:
+        try:
+            with self._db.session() as session:
+                exists = session.scalar(select(RootDetectorShadowEpisodeRootLinkModel.id).where(
+                    RootDetectorShadowEpisodeRootLinkModel.episode_id == episode_id,
+                    RootDetectorShadowEpisodeRootLinkModel.root_event_id == root_event_id,
+                    RootDetectorShadowEpisodeRootLinkModel.link_type == link_type,
+                ))
+                if exists is None:
+                    session.add(RootDetectorShadowEpisodeRootLinkModel(
+                        episode_id=episode_id, root_event_id=root_event_id, linked_at=linked_at,
+                        link_type=link_type, event_revision=event_revision,
+                    ))
+            return True
+        except Exception:
+            logger.exception("root detector shadow episode link failed")
+            return False
+
+    def map_legacy_root_detector_shadow_candidates(self, *, mapping_version: str = "ROOT_EPISODE_MAP_V1") -> int:
+        """Create deterministic legacy mappings without modifying raw candidate rows."""
+        try:
+            with self._db.session() as session:
+                candidates = session.scalars(select(RootDetectorShadowCandidateModel).order_by(RootDetectorShadowCandidateModel.symbol, RootDetectorShadowCandidateModel.first_seen_at, RootDetectorShadowCandidateModel.id)).all()
+                active: dict[str, tuple[str, datetime]] = {}
+                created = 0
+                for candidate in candidates:
+                    existing = session.get(RootDetectorShadowLegacyMappingModel, candidate.candidate_id)
+                    if existing is not None:
+                        active[candidate.symbol] = (existing.episode_id, _ensure_utc(candidate.first_seen_at))
+                        continue
+                    last = active.get(candidate.symbol)
+                    if last is None or _ensure_utc(candidate.first_seen_at) - last[1] > timedelta(minutes=30):
+                        episode_id = uuid.uuid4().hex
+                        active[candidate.symbol] = (episode_id, _ensure_utc(candidate.first_seen_at))
+                        session.add(RootDetectorShadowEpisodeModel(
+                            episode_id=episode_id, symbol=candidate.symbol, opened_at=candidate.first_seen_at,
+                            last_trigger_at=candidate.first_seen_at, last_high=candidate.event_high,
+                            episode_status="CLOSED", closed_at=candidate.first_seen_at,
+                            episode_mapping_version=mapping_version, code_version=candidate.code_version,
+                            runtime_instance_id=candidate.runtime_instance_id, runtime_started_at=candidate.runtime_started_at,
+                        ))
+                    else:
+                        episode_id = last[0]
+                        active[candidate.symbol] = (episode_id, _ensure_utc(candidate.first_seen_at))
+                    session.add(RootDetectorShadowLegacyMappingModel(
+                        legacy_candidate_id=candidate.candidate_id, episode_id=episode_id,
+                        episode_mapping_version=mapping_version,
+                        mapping_reason="GAP_ONLY_30M_LEGACY_ORDERED",
+                    ))
+                    created += 1
+                return created
+        except Exception:
+            logger.exception("root detector shadow legacy mapping failed")
+            return 0
+
+    def list_root_detector_shadow_episode_outcomes_due(self, *, due_at: datetime, limit: int = 100) -> list[dict[str, Any]]:
+        with self._db.session() as session:
+            rows = session.scalars(select(RootDetectorShadowEpisodeOutcomeModel)
+                .where(RootDetectorShadowEpisodeOutcomeModel.outcome_next_due_at.is_not(None), RootDetectorShadowEpisodeOutcomeModel.outcome_next_due_at <= due_at)
+                .order_by(RootDetectorShadowEpisodeOutcomeModel.outcome_next_due_at).limit(limit)).all()
+            return [{"episode_id": row.episode_id, "outcome_status": row.outcome_status, "outcome_next_due_at": row.outcome_next_due_at} for row in rows]
+
+    def record_root_detector_shadow_episode_outcome_attempt(self, episode_id: str, *, outcome: dict[str, Any] | None = None, error: str | None = None, next_due_at: datetime | None = None, computed_at: datetime | None = None) -> bool:
+        try:
+            now = _ensure_utc(computed_at or datetime.now(timezone.utc))
+            with self._db.session() as session:
+                row = session.get(RootDetectorShadowEpisodeOutcomeModel, episode_id)
+                if row is None:
+                    return False
+                row.outcome_last_attempt_at = now
+                row.outcome_attempt_count = int(row.outcome_attempt_count or 0) + 1
+                row.outcome_next_due_at = next_due_at
+                row.outcome_updated_at = now
+                row.outcome_last_error = str(error)[:255] if error else None
+                if outcome:
+                    row.outcome_status = outcome.get("outcome_status", row.outcome_status)
+                    row.outcome_computed_at = now
+                    row.outcome_method_version = outcome.get("outcome_method_version", "ROOT_SHADOW_OUTCOME_V2")
+                    for label, field in (("15m", "return_15m"), ("30m", "return_30m"), ("1h", "return_1h"), ("4h", "return_4h"), ("12h", "return_12h"), ("24h", "return_24h"), ("48h", "return_48h")):
+                        value = (outcome.get("horizons", {}).get(label) or {}).get("short_return_pct")
+                        if value is not None and getattr(row, field) is None:
+                            setattr(row, field, value)
+                    for label, field in (("1h", "mfe_1h"), ("4h", "mfe_4h"), ("12h", "mfe_12h"), ("24h", "mfe_24h")):
+                        value = (outcome.get("mfe_by_horizon") or {}).get(label)
+                        if value is not None and getattr(row, field) is None:
+                            setattr(row, field, value)
+                    for label, field in (("1h", "mae_1h"), ("4h", "mae_4h"), ("12h", "mae_12h"), ("24h", "mae_24h")):
+                        value = (outcome.get("mae_by_horizon") or {}).get(label)
+                        if value is not None and getattr(row, field) is None:
+                            setattr(row, field, value)
+                    row.new_high_after_episode = outcome.get("new_high_after_candidate", row.new_high_after_episode)
+                    row.coverage_end_at = outcome.get("coverage_end_at", row.coverage_end_at)
+            return True
+        except Exception:
+            logger.exception("root detector shadow episode outcome write failed")
+            return False
+
     def append_root_detector_shadow_observation(self, candidate_id: str, observation: dict[str, Any]) -> bool:
         try:
             with self._db.session() as session:
@@ -297,6 +447,17 @@ class BotRepository:
                 peak = _ensure_utc(peak_time)
                 row.candidate_to_root_latency = max(0.0, (created - first_seen).total_seconds()) if created and first_seen else None
                 row.peak_to_root_latency = max(0.0, (created - peak).total_seconds()) if created and peak else None
+                if session.get(RootDetectorShadowEpisodeModel, candidate_id) is not None:
+                    link_exists = session.scalar(select(RootDetectorShadowEpisodeRootLinkModel.id).where(
+                        RootDetectorShadowEpisodeRootLinkModel.episode_id == candidate_id,
+                        RootDetectorShadowEpisodeRootLinkModel.root_event_id == root_event_id,
+                        RootDetectorShadowEpisodeRootLinkModel.link_type == "FIRST_ROOT",
+                    ))
+                    if link_exists is None:
+                        session.add(RootDetectorShadowEpisodeRootLinkModel(
+                            episode_id=candidate_id, root_event_id=root_event_id, linked_at=root_created_at,
+                            link_type="FIRST_ROOT", event_revision=None,
+                        ))
             return True
         except Exception:
             logger.exception("root detector shadow linkage write failed")
@@ -448,6 +609,10 @@ class BotRepository:
                     runtime_started_at=provenance.runtime_started_at,
                     decision_at=provenance.decision_at,
                     signal_created_at=model.created_at,
+                    decision_entry_price=provenance.decision_entry_price,
+                    decision_event_high=provenance.decision_event_high,
+                    decision_distance_from_high=provenance.decision_distance_from_high,
+                    provenance_anomaly=provenance.provenance_anomaly,
                 )
             )
             if delivery_payload is not None:
