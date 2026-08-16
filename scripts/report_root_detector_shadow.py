@@ -26,10 +26,10 @@ def main() -> None:
         ).fetchone()[0])
     coverage = [dict(row) for row in connection.execute("SELECT scan_status, exclusion_reason, COUNT(*) AS n FROM market_coverage_ledger GROUP BY scan_status, exclusion_reason ORDER BY scan_status, exclusion_reason")]
     candidates = [dict(row) for row in connection.execute("SELECT candidate_id, symbol, first_seen_at, live_root_created, live_root_event_id, candidate_to_root_latency, peak_to_root_latency, outcome_status, outcome_mfe_pct, outcome_mae_pct, outcome_json FROM root_detector_shadow_candidates ORDER BY first_seen_at, id")]
-    episode_count = count("root_detector_shadow_episodes") if _has_table(connection, "root_detector_shadow_episodes") else 0
-    observation_count = count("root_detector_shadow_observations") if _has_table(connection, "root_detector_shadow_observations") else 0
+    episode_count = count("root_detector_shadow_episodes") if _has_table("root_detector_shadow_episodes") else 0
+    observation_count = count("root_detector_shadow_observations") if _has_table("root_detector_shadow_observations") else 0
     episode_outcomes = []
-    if _has_table(connection, "root_detector_shadow_episode_outcomes"):
+    if _has_table("root_detector_shadow_episode_outcomes"):
         episode_outcomes = [dict(row) for row in connection.execute("SELECT * FROM root_detector_shadow_episode_outcomes ORDER BY episode_id")]
     horizon_summary = {}
     for label in ("15m", "30m", "1h", "4h", "12h", "24h"):
